@@ -3399,7 +3399,13 @@ void TestUploadGeneration() {
   Check(wake.Enqueue("w", v1, false), "the waited store is queued");
   auto wake_item = wake.TakeReady(now, &soonest);
   Check(wake_item.has_value(), "the waited store is in flight");
-  Check(!wake.Enqueue("w", big, false), "the waited re-put is refused");
+  uint64_t refusal_id = 0;
+  Check(!wake.Enqueue("w", big, false, nullptr, nullptr, &refusal_id),
+        "the waited re-put is refused");
+  const auto v3 = std::make_shared<const std::string>("v3");
+  Check(wake.Enqueue("w", v3, false), "a newer store overtakes the refusal");
+  Check(wake.RefusalStillInFlight(refusal_id), "the refusal still waits for v1");
+  Check(wake.RefusalOvertaken(refusal_id), "the refused value is overtaken");
   if (wake_item) {
     std::mutex mu;
     std::condition_variable cv;
@@ -3409,8 +3415,10 @@ void TestUploadGeneration() {
       std::unique_lock<std::mutex> lock(mu);
       parked = true;
       cv.notify_all();
-      cv.wait(lock, [&] { return !wake.in_flight("w"); });
-      released = true;
+      const bool woke = cv.wait_for(lock, std::chrono::seconds(2), [&] {
+        return !wake.RefusalStillInFlight(refusal_id);
+      });
+      released = woke && !wake.RefusalStillInFlight(refusal_id);
     });
     {
       std::unique_lock<std::mutex> lock(mu);
@@ -3420,10 +3428,12 @@ void TestUploadGeneration() {
     {
       std::lock_guard<std::mutex> lock(mu);
       wake.Finish(*wake_item);
+      wake.TakeReady(now, &soonest);
     }
     cv.notify_all();
     waiter.join();
-    Check(released, "the waiter is released when the in-flight upload finishes");
+    Check(released, "the waiter is released by finish of v1 even when v3 is in flight");
+    Check(wake.in_flight("w"), "v3 stays in flight after v1 finishes");
   }
 }
 
