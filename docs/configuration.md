@@ -651,6 +651,13 @@ opens one compile session on each cache miss; read-only clients and daemon-off
 invocations skip it. Scheduling operations build on this protocol version 2
 session; lookups and stores keep their own connections.
 
+`daemon.jobserver` (`VCACHE_DAEMON_JOBSERVER`) adds a fixed fifo of job slots
+that make, ninja and cargo share. `daemon.jobserver_jobs`
+(`VCACHE_DAEMON_JOBSERVER_JOBS`) is the number of '+' tokens; unset means
+the machine's online CPUs, and 0 or a negative value warns and does the same.
+`vcache --jobserver-env` prints the `MAKEFLAGS` line, or exits 1 when no pool
+is running. See [daemon.md](daemon.md) for the protocol and the tool versions.
+
 See [daemon.md](daemon.md) for the commands, the files it keeps, running it
 under systemd, and measurements.
 These switches belong to each client. A daemon started by a client with the

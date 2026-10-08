@@ -239,7 +239,8 @@ VCACHE_SRCS := \
   $(SRC)/daemon/protocol.cc \
   $(SRC)/daemon/client.cc \
   $(SRC)/daemon/server.cc \
-  $(SRC)/daemon/upload_queue.cc
+  $(SRC)/daemon/upload_queue.cc \
+  $(SRC)/daemon/jobserver.cc
 
 MAIN_SRC := $(SRC)/main.cc
 

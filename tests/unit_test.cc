@@ -3,6 +3,7 @@
 // Unit tests for vcache. Deliberately dependency-free: a tiny harness keeps the
 // build to plain make, as the plan asks.
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <poll.h>
@@ -34,6 +35,7 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include "daemon/jobserver.h"
 #include <string>
 #include <thread>
 #include <utility>
@@ -3623,6 +3625,73 @@ void TestDiskStorageEviction() {
   }
 }
 
+void TestJobserver() {
+  Section("daemon::jobserver");
+
+  CheckEq(daemon::JobserverMakeFlagsLine("/tmp/vcache-jobserver.fifo"),
+          "MAKEFLAGS=-j --jobserver-auth=fifo:/tmp/vcache-jobserver.fifo\n",
+          "--jobserver-env output format");
+
+  TempCacheDir dir;
+  const std::string path = dir.path() + "/jobserver.fifo";
+  ::mkfifo(path.c_str(), 0600);
+  {
+    const int stale = ::open(path.c_str(), O_RDWR | O_NONBLOCK);
+    if (stale >= 0) {
+      const char extra = 'x';
+      ssize_t ignored = ::write(stale, &extra, 1);
+      (void)ignored;
+      ::close(stale);
+    }
+  }
+  std::string error;
+  auto pool = daemon::JobserverPool::Open(path, 3, &error);
+  Check(pool.has_value(), "a stale fifo is replaced (" + error + ")");
+  if (!pool) return;
+
+  struct stat st {};
+  Check(::stat(path.c_str(), &st) == 0 && S_ISFIFO(st.st_mode) && (st.st_mode & 0777) == 0600,
+        "the fifo is mode 0600");
+  Check(pool->total() == 3 && pool->fifo_bytes() == 2 && pool->free_tokens() == 3 &&
+            pool->withdrawn() == 0,
+        "the fifo holds slots-1 bytes and reports N jobs free");
+
+  const int reader = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+  char token = 0;
+  Check(reader >= 0 && ::read(reader, &token, 1) == 1 && token == '+',
+        "a client can take one token");
+  Check(pool->free_tokens() == 2, "taking a token leaves N-1");
+  const int writer = ::open(path.c_str(), O_WRONLY | O_NONBLOCK);
+  const char back = '+';
+  Check(writer >= 0 && ::write(writer, &back, 1) == 1, "a client can return a token");
+  Check(pool->free_tokens() == 3, "returning a token restores N");
+  if (reader >= 0) ::close(reader);
+  if (writer >= 0) ::close(writer);
+
+  pool.reset();
+  Check(::lstat(path.c_str(), &st) != 0, "destroying the pool removes the fifo");
+
+  ::setenv("VCACHE_DAEMON_JOBSERVER", "1", 1);
+  ::setenv("VCACHE_DAEMON_JOBSERVER_JOBS", "-2", 1);
+  const core::Config negative = core::LoadConfig();
+  bool warned = false;
+  for (const std::string& warning : negative.warnings) {
+    if (warning.find("VCACHE_DAEMON_JOBSERVER_JOBS") != std::string::npos) warned = true;
+  }
+  Check(negative.daemon.jobserver && negative.daemon.jobserver_jobs == 0 && warned,
+        "a negative jobserver_jobs warns and uses the online-CPU default");
+  ::setenv("VCACHE_DAEMON_JOBSERVER_JOBS", "0", 1);
+  const core::Config zero = core::LoadConfig();
+  warned = false;
+  for (const std::string& warning : zero.warnings) {
+    if (warning.find("VCACHE_DAEMON_JOBSERVER_JOBS") != std::string::npos) warned = true;
+  }
+  Check(zero.daemon.jobserver_jobs == 0 && warned,
+        "jobserver_jobs of 0 warns and uses the online-CPU default");
+  ::unsetenv("VCACHE_DAEMON_JOBSERVER");
+  ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
+}
+
 }  // namespace
 
 // A replayed artifact has to be as readable as a compiled one. mkstemp creates
@@ -4458,6 +4527,7 @@ int main(int argc, char** argv) {
   TestAdmissionProcessTree();
   TestAdmissionReview();
   TestAdmissionBoundsAndTreePeaks();
+  TestJobserver();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
