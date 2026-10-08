@@ -236,6 +236,11 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
   hit. Measured on one translation unit from this repository: a vcache hit takes
   ~77 ms against ~9 ms for a ccache hit and ~1.50 s to actually compile. The gap
   is preprocessing. ccache's "direct mode" avoids it by hashing the source plus
+  `VCACHE_TEST_REFUSAL_WAIT_MS` shrinks how long a refused re-put waits for
+  the in-flight upload, when set to a positive number of milliseconds no
+  larger than half the client reply timeout. Unset, that wait stays 150
+  seconds. `MOCK_S3_DENY_PUT_MIN_BYTES` makes the test bucket answer 403 for
+  a PUT whose body is at least that many bytes.
   a manifest of includes recorded from a previous run; the manifest has to be
   validated against the current file contents, which is why it is a real piece
   of work rather than a switch. This is the main remaining performance win, and
