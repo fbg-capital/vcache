@@ -319,7 +319,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
   // Tracks whether any layer was broken, as opposed to cold, for this run.
   bool media_failed = false;
 
-  if (!config.recache && cache != nullptr) {
+  const auto try_entry_hit = [&]() {
+    if (cache == nullptr) return false;
     storage::GetResult got = cache->Get(key);
     media_failed |= core::ReportCacheMediaErrors(got.errors, cache_dir);
     if (got.hit) {
@@ -333,16 +334,25 @@ int RunRustCompile(const std::vector<std::string>& argv,
         VCACHE_LOG("rust hit on " + got.layer);
         core::RecordCounter(cache_dir, got.layer == "s3" ? Counter::kHitS3
                                                          : Counter::kHitDisk);
-        return 0;
+        return true;
       }
       VCACHE_LOG("rust: unusable cache entry; recompiling");
     }
-  }
-  core::RecordCounter(cache_dir, Counter::kMiss);
+    return false;
+  };
+  if (!config.recache && try_entry_hit()) return 0;
 
   // ---- miss: compile into a staging directory -----------------------------
 
   auto session = daemon::DaemonClient::OpenCompileSession(config);
+  if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
+    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(std::nullopt));
+    if (outcome != daemon::LeaseOutcome::kCompile && try_entry_hit()) {
+      session->ReleaseLease(true);
+      return 0;
+    }
+  }
+  core::RecordCounter(cache_dir, Counter::kMiss);
 
   const std::string stage_dir = *temp_dir + "/out";
   if (!util::MakeDirs(stage_dir)) return RunPassthrough(argv);
@@ -404,6 +414,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   core::AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 
   const storage::PutResult put = cache->Put(key, storage::SerializeBlob(blob));
+  if (session) session->ReleaseLease(put.stored);
   media_failed |= core::ReportCacheMediaErrors(put.errors, cache_dir);
   if (put.stored) {
     core::RecordCounter(cache_dir, Counter::kStored);
