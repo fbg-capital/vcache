@@ -248,8 +248,11 @@ class Server {
   void ReleaseS3(std::unique_ptr<storage::S3Storage> s3);
 
   // Queues an upload. Returns false only when the blob could not be held.
-  bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
-               bool journal);
+  // `refused_in_flight` is set when that refusal replaced an upload already
+  // being sent, so the caller can wait for it before uploading the new value.
+  bool Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal,
+               bool* refused_in_flight = nullptr);
+  bool WaitForInFlight(const std::string& key);
   void UploadWorker();
   void Shutdown();
   bool Idle() const;
@@ -437,14 +440,32 @@ void Server::RecoverJournal() {
             " uploads journalled by a previous daemon");
 }
 
-bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob,
-                     bool journal) {
+bool Server::Enqueue(const std::string& key, std::shared_ptr<const std::string> blob, bool journal,
+                     bool* refused_in_flight) {
   std::unique_lock<std::mutex> lock(mutex_);
   bool merged = false;
-  if (!uploads_.Enqueue(key, std::move(blob), journal, &merged)) return false;
-  if (!merged) counters_.uploads_queued++;
+  bool in_flight = false;
+  if (!uploads_.Enqueue(key, std::move(blob), journal, &merged, &in_flight)) {
+    if (refused_in_flight != nullptr) *refused_in_flight = in_flight;
+    return false;
+  }
+  // A key already waiting keeps its one queued upload. A key in flight is
+  // counted when that upload finishes and the newer value is queued.
+  if (!merged && !in_flight) counters_.uploads_queued++;
   lock.unlock();
   cv_.notify_all();
+  return true;
+}
+
+bool Server::WaitForInFlight(const std::string& key) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  const auto deadline = Clock::now() + std::chrono::seconds(kReplyTimeoutSeconds);
+  while (uploads_.in_flight(key)) {
+    if (cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+      log_.Line("refused re-put of " + key + " uploaded without waiting");
+      return false;
+    }
+  }
   return true;
 }
 
@@ -503,7 +524,9 @@ void Server::UploadWorker() {
     lock.lock();
     --in_flight_;
     if (done) {
-      if (uploads_.Finish(item)) {
+      bool count_requeue = false;
+      if (uploads_.Finish(item, &count_requeue)) {
+        if (count_requeue) counters_.uploads_queued++;
         log_.Line("re-queued " + item.key + " (rewritten during upload)");
       }
     } else {
@@ -839,20 +862,25 @@ void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
   if (s3_writable_ && test_put_allowed) {
     if (on_disk) {
       stored = Enqueue(key, nullptr, /*journal=*/true) || stored;
-    } else if (Enqueue(key, value, /*journal=*/false)) {
-      stored = true;
     } else {
-      // The memory queue is full: upload here and make this one store wait,
-      // rather than grow without bound.
-      auto s3 = AcquireS3();
-      if (s3->Put(key, *value)) {
+      bool refused_in_flight = false;
+      if (Enqueue(key, value, /*journal=*/false, &refused_in_flight)) {
         stored = true;
-        counters_.uploads_done++;
-        counters_.upload_bytes += value->size();
-      } else if (s3->failed()) {
-        errors.push_back("s3: " + s3->last_error());
+      } else {
+        // The memory queue is full: upload here and make this one store wait,
+        // rather than grow without bound. An upload already in flight has to
+        // finish first, or its later completion overwrites this value.
+        if (refused_in_flight) WaitForInFlight(key);
+        auto s3 = AcquireS3();
+        if (s3->Put(key, *value)) {
+          stored = true;
+          counters_.uploads_done++;
+          counters_.upload_bytes += value->size();
+        } else if (s3->failed()) {
+          errors.push_back("s3: " + s3->last_error());
+        }
+        ReleaseS3(std::move(s3));
       }
-      ReleaseS3(std::move(s3));
     }
   }
 
@@ -884,7 +912,7 @@ std::string Server::StatusText() {
   size_t leases_held = 0;
   size_t leases_waiting = 0;
   size_t pending = 0;
-  int in_flight = 0;
+  size_t superseded = 0;
   uint64_t held = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -896,8 +924,8 @@ std::string Server::StatusText() {
         leases_waiting += state.compile->waiters.size();
       }
     }
-    pending = uploads_.size();
-    in_flight = in_flight_;
+    superseded = uploads_.superseded_count();
+    pending = uploads_.size() + uploads_.in_flight_count() - superseded;
     held = uploads_.held_bytes();
   }
   const auto uptime =
@@ -930,7 +958,8 @@ std::string Server::StatusText() {
   s += row("  bytes", n(counters_.upload_bytes));
   s += row("  failed", n(counters_.uploads_failed));
   s += row("  skipped", n(counters_.uploads_skipped));
-  s += row("  pending", std::to_string(pending + static_cast<size_t>(in_flight)));
+  s += row("  pending", std::to_string(pending));
+  s += row("uploads superseded", std::to_string(superseded));
   s += row("  held in memory", std::to_string(held) + " bytes");
   return s;
 }

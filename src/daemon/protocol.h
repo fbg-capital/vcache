@@ -27,6 +27,8 @@ namespace vcache::daemon {
 // kHello, which makes a client and daemon from different releases fall back
 // cleanly instead of misparsing each other.
 constexpr uint64_t kProtocolVersion = 2;
+// How long a client waits for one reply, and how long a refused re-put waits
+// for the upload it replaces. Longer than one S3 request including its retries.
 constexpr int kReplyTimeoutSeconds = 300;
 
 enum class Op : uint8_t {
