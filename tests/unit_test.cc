@@ -2581,6 +2581,12 @@ void TestCost() {
         "a cost file from today survives trim");
 }
 
+void TestHeldHitLayer() {
+  Section("daemon::held hit");
+  CheckEq(std::string(daemon::HeldHitLayerName()), "memory",
+          "a held hit replies with layer memory");
+}
+
 }  // namespace
 
 int main() {
@@ -2617,6 +2623,7 @@ int main() {
   TestLinkTraceClassification();
   TestRunRusage();
   TestCost();
+  TestHeldHitLayer();
 
   std::printf("\n\033[1munit: %d passed, %d failed\033[0m\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
