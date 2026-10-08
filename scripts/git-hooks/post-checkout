@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# post-checkout: $1 = previous HEAD, $2 = new HEAD, $3 = 1 for a branch checkout.
+# A fast-forward `git rebase origin/main` replays no commits, so post-rewrite never
+# runs, but git does run this hook for it (flag=1). When the two HEADs differ in
+# .beads/issues.jsonl the worktree's SQLite is behind the file; import so the next
+# flush cannot export a stale DB back over rows another checkout committed.
+[[ "$3" == "1" ]] || exit 0
+[[ "$1" != "$2" ]] || exit 0
+
+GIT_ROOT=$(git rev-parse --show-toplevel) || exit 0
+cd "$GIT_ROOT" || exit 0
+[[ -f .beads/issues.jsonl ]] || exit 0
+
+# A fresh clone passes an all-zero previous HEAD; git diff fails on it, which correctly falls through to the import.
+if git diff --quiet "$1" "$2" -- .beads/issues.jsonl 2>/dev/null; then
+    exit 0
+fi
+
+if [[ -x "$GIT_ROOT/scripts/git-hooks/beads-import" ]]; then
+    "$GIT_ROOT/scripts/git-hooks/beads-import" post-checkout
+elif ! br sync --import-only -q; then
+    echo "post-checkout: br sync --import-only failed; do not commit .beads until it succeeds" >&2
+fi
+# Never block: the checkout has already happened and its exit status is ignored anyway.
+exit 0

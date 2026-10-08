@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# post-merge: runs after `git pull` / `git merge` (fast-forward included). When the
+# merge moved .beads/issues.jsonl, import it so this worktree's SQLite is not behind
+# the committed file (see post-rewrite for why that matters).
+GIT_ROOT=$(git rev-parse --show-toplevel) || exit 0
+cd "$GIT_ROOT" || exit 0
+[[ -f .beads/issues.jsonl ]] || exit 0
+
+if git rev-parse -q --verify ORIG_HEAD >/dev/null 2>&1 && git diff --quiet ORIG_HEAD HEAD -- .beads/issues.jsonl; then
+    exit 0
+fi
+
+if [[ -x "$GIT_ROOT/scripts/git-hooks/beads-import" ]]; then
+    "$GIT_ROOT/scripts/git-hooks/beads-import" post-merge
+elif ! br sync --import-only -q; then
+    echo "post-merge: br sync --import-only failed; do not commit .beads until it succeeds" >&2
+fi
+# Never block: the merge has already happened and its exit status is ignored anyway.
+exit 0

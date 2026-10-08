@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# beads-import <hook-name>: bring this worktree's beads SQLite in line with the committed
+# .beads/issues.jsonl after a checkout, merge or rebase moved it. Called by post-checkout,
+# post-merge and post-rewrite; never blocks.
+#
+# A plain `br sync --import-only` takes a row only when its updated_at is newer than SQLite's,
+# so a row rewritten in git without a bump (a text fix, renumbered comment ids, a dropped
+# source_repo_path) stays stale, and the next full export (any br write) writes the
+# stale form back over it. `--rebuild` treats the file as authoritative; it runs only when no
+# unexported local edit exists and the working file is the committed one, so nothing is lost.
+hook=${1:-beads-import}
+
+dirty=$(br sync --status 2>/dev/null | sed -n 's/^ *Dirty issues: *\([0-9]*\).*/\1/p')
+if [[ "$dirty" == "0" ]] && git diff --quiet HEAD -- .beads/issues.jsonl 2>/dev/null; then
+    if br sync --import-only --rebuild -q; then
+        exit 0
+    fi
+    echo "$hook: br sync --import-only --rebuild failed; falling back to a plain import" >&2
+fi
+
+if ! br sync --import-only -q; then
+    echo "$hook: br sync --import-only failed; do not commit .beads until it succeeds" >&2
+    exit 0
+fi
+if [[ -n "$dirty" && "$dirty" != "0" ]]; then
+    echo "$hook: kept $dirty unexported beads edit(s); rows rewritten upstream without an updated_at bump stay stale until the next clean import" >&2
+fi
+exit 0

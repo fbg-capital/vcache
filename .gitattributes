@@ -1,0 +1,1 @@
+.beads/issues.jsonl -diff merge=beads-union-dedup linguist-generated=true

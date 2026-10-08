@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Git has no post-rebase hook; post-rewrite is the closest thing, firing after
+# `git rebase` and `git commit --amend` with the reason in $1. A rebase that
+# brings in someone else's .beads/issues.jsonl leaves this worktree's SQLite
+# behind it, and the next export (any br write) would then write the stale DB
+# straight back over their rows. Importing here closes that window.
+#
+# git skips post-rewrite when a rebase replays no commits; a fast-forward
+# `git rebase origin/main` fires post-checkout instead and `git pull` fires
+# post-merge. Those two hooks run the same import, so every path that can move
+# .beads/issues.jsonl under this worktree is covered.
+[[ "$1" == "rebase" ]] || exit 0
+
+GIT_ROOT=$(git rev-parse --show-toplevel) || exit 0
+cd "$GIT_ROOT" || exit 0
+[[ -f .beads/issues.jsonl ]] || exit 0
+
+if [[ -x "$GIT_ROOT/scripts/git-hooks/beads-import" ]]; then
+    "$GIT_ROOT/scripts/git-hooks/beads-import" post-rewrite
+elif ! br sync --import-only -q; then
+    echo "post-rewrite: br sync --import-only failed; do not commit .beads until it succeeds" >&2
+fi
+# Never block: the rebase has already happened and its exit status is ignored anyway.
+exit 0
