@@ -16,6 +16,7 @@
 namespace vcache::daemon {
 
 uint64_t LeaseWaitBoundMs(std::optional<uint64_t> recorded_wall_ms);
+uint64_t SchedulingReplyTimeoutSeconds(uint64_t bound_ms);
 
 class CompileSessionHandle {
  public:
@@ -28,7 +29,7 @@ class CompileSessionHandle {
  private:
   friend class DaemonClient;
   explicit CompileSessionHandle(int fd) : fd_(fd) {}
-  bool Request(const std::string& request, std::string* reply);
+  bool Request(const std::string& request, std::string* reply, std::string* refusal = nullptr);
   void Unavailable(const std::string& why);
 
   int fd_;

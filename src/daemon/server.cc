@@ -176,8 +176,10 @@ struct CompileSession {
 
 struct LeaseWait {
   std::weak_ptr<CompileSession> holder;
+  pid_t holder_pid = 0;
   Clock::time_point acquired_at = Clock::now();
   std::set<int> waiters;
+  size_t stores_in_progress = 0;
   std::optional<LeaseOutcome> outcome;
   LeaseCompileReason reason = LeaseCompileReason::kNone;
   std::condition_variable changed;
@@ -194,7 +196,6 @@ struct CacheFetch {
 struct KeyLease {
   std::shared_ptr<LeaseWait> compile;
   std::shared_ptr<CacheFetch> fetch;
-  size_t stores_in_progress = 0;
 };
 
 class Server {
@@ -219,7 +220,7 @@ class Server {
   bool HandleHello(const std::string& request, std::string* reply);
   void HandleGet(Reader* in, Writer* out);
   std::shared_ptr<CacheFetch> FetchKey(const std::string& key);
-  void HandlePut(Reader* in, Writer* out);
+  void HandlePut(Reader* in, Writer* out, pid_t peer_pid);
   bool AwaitTestPut(const std::string& key);
   void HandleLeaseAcquire(Reader* in, Writer* out,
                           const std::shared_ptr<CompileSession>& session);
@@ -545,7 +546,7 @@ void Server::CompleteLease(const std::string& key, LeaseOutcome outcome,
     lease->changed.notify_all();
     found->second.compile.reset();
   }
-  if (!found->second.compile && !found->second.fetch && found->second.stores_in_progress == 0) {
+  if (!found->second.compile && !found->second.fetch) {
     leases_.erase(found);
   }
 }
@@ -555,7 +556,8 @@ void Server::ExpireLeases(const std::shared_ptr<CompileSession>& session) {
   for (const auto& [key, state] : leases_) {
     // A Put already accepted on another connection decides the result even
     // if its holder is killed before storage finishes.
-    if (state.compile && state.compile->holder.lock() == session && state.stores_in_progress == 0) {
+    if (state.compile && state.compile->holder.lock() == session &&
+        state.compile->stores_in_progress == 0) {
       held_keys.push_back(key);
     }
   }
@@ -569,7 +571,7 @@ void Server::HandleLeaseAcquire(Reader* in, Writer* out,
                                 const std::shared_ptr<CompileSession>& session) {
   std::string key;
   uint64_t bound_ms = 0;
-  if (!session || !config_.daemon.single_flight || config_.read_only ||
+  if (!session || config_.read_only ||
       !in->Str(&key) || !ValidKey(key) || !in->U64(&bound_ms) || !in->done()) {
     out->U8(static_cast<uint8_t>(Status::kError));
     out->Str("invalid lease acquire");
@@ -587,10 +589,11 @@ void Server::HandleLeaseAcquire(Reader* in, Writer* out,
     if (!state.compile) {
       state.compile = std::make_shared<LeaseWait>();
       state.compile->holder = session;
+      state.compile->holder_pid = session->client_pid;
     }
     auto lease = state.compile;
     const auto holder = lease->holder.lock();
-    holder_pid = holder ? holder->client_pid : 0;
+    holder_pid = lease->holder_pid;
     if (holder == session) {
       outcome = LeaseOutcome::kGranted;
       reason = LeaseCompileReason::kNone;
@@ -598,15 +601,20 @@ void Server::HandleLeaseAcquire(Reader* in, Writer* out,
       lease->waiters.insert(session->fd);
       VCACHE_LOG("lease: waiting on holder pid " + std::to_string(holder_pid) + " up to " +
                  std::to_string(bound_ms) + " ms");
+      bool waiter_gone = false;
       while (!lease->outcome && !stop_requested_.load() && Clock::now() < deadline) {
+        lease->changed.wait_until(lock, std::min(deadline,
+                                      Clock::now() + std::chrono::milliseconds(250)));
+        if (lease->outcome || stop_requested_.load()) break;
+        lock.unlock();
         pollfd peer{session->fd, POLLIN, 0};
         if (::poll(&peer, 1, 0) > 0) {
           char byte;
           if (::recv(session->fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0 ||
-              (peer.revents & (POLLHUP | POLLERR | POLLNVAL))) break;
+              (peer.revents & (POLLHUP | POLLERR | POLLNVAL))) waiter_gone = true;
         }
-        lease->changed.wait_until(lock, std::min(deadline,
-                                      Clock::now() + std::chrono::milliseconds(20)));
+        lock.lock();
+        if (waiter_gone) break;
       }
       lease->waiters.erase(session->fd);
       if (lease->outcome) {
@@ -619,6 +627,7 @@ void Server::HandleLeaseAcquire(Reader* in, Writer* out,
       const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           Clock::now() - started).count();
       VCACHE_LOG("lease: wait ended after " + std::to_string(waited_ms) + " ms");
+      if (waiter_gone) VCACHE_LOG("lease: waiter gone after " + std::to_string(waited_ms) + " ms");
     }
   }
   out->U8(static_cast<uint8_t>(Status::kOk));
@@ -632,7 +641,7 @@ void Server::HandleLeaseRelease(Reader* in, Writer* out,
                                 const std::shared_ptr<CompileSession>& session) {
   std::string key;
   uint8_t outcome = 0;
-  if (!session || !config_.daemon.single_flight || !in->Str(&key) || !ValidKey(key) ||
+  if (!session || !in->Str(&key) || !ValidKey(key) ||
       !in->U8(&outcome) || outcome > 1 || !in->done()) {
     out->U8(static_cast<uint8_t>(Status::kError));
     out->Str("invalid lease release");
@@ -653,7 +662,7 @@ void Server::HandleLeaseRelease(Reader* in, Writer* out,
 
 std::shared_ptr<CacheFetch> Server::FetchKey(const std::string& key) {
   std::shared_ptr<CacheFetch> fetch;
-  if (config_.daemon.single_flight) {
+  {
     std::unique_lock<std::mutex> lock(mutex_);
     auto& state = leases_[key];
     fetch = state.fetch;
@@ -692,7 +701,7 @@ std::shared_ptr<CacheFetch> Server::FetchKey(const std::string& key) {
     const auto found = leases_.find(key);
     if (found != leases_.end() && found->second.fetch == fetch) {
       found->second.fetch.reset();
-      if (!found->second.compile && found->second.stores_in_progress == 0) leases_.erase(found);
+      if (!found->second.compile) leases_.erase(found);
     }
   }
   return fetch;
@@ -781,7 +790,7 @@ bool Server::AwaitTestPut(const std::string& key) {
   return outcome == 's';
 }
 
-void Server::HandlePut(Reader* in, Writer* out) {
+void Server::HandlePut(Reader* in, Writer* out, pid_t peer_pid) {
   std::string key;
   auto value = std::make_shared<std::string>();
   if (!in->Str(&key) || !ValidKey(key) || !in->Str(value.get())) {
@@ -790,9 +799,17 @@ void Server::HandlePut(Reader* in, Writer* out) {
     return;
   }
   counters_.stores++;
+  std::shared_ptr<LeaseWait> storing_lease;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (config_.daemon.single_flight) ++leases_[key].stores_in_progress;
+    const auto found = leases_.find(key);
+    if (found != leases_.end() && found->second.compile) {
+      const pid_t holder_pid = found->second.compile->holder_pid;
+      if (peer_pid == 0 || holder_pid == 0 || holder_pid == peer_pid) {
+        storing_lease = found->second.compile;
+        ++storing_lease->stores_in_progress;
+      }
+    }
   }
   std::vector<std::string> errors;
   bool stored = false;
@@ -831,8 +848,8 @@ void Server::HandlePut(Reader* in, Writer* out) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto found = leases_.find(key);
-    if (found != leases_.end() && found->second.stores_in_progress > 0) {
-      --found->second.stores_in_progress;
+    if (storing_lease) --storing_lease->stores_in_progress;
+    if (found != leases_.end() && storing_lease && found->second.compile == storing_lease) {
       CompleteLease(key, stored ? LeaseOutcome::kStored : LeaseOutcome::kCompile,
                      stored ? LeaseCompileReason::kNone : LeaseCompileReason::kHolderFailed);
     }
@@ -925,6 +942,14 @@ void Server::Serve(int fd) {
   bool ok = RecvFrame(fd, &request) && HandleHello(request, &reply);
   SendFrame(fd, reply);
   bool first_request = true;
+  pid_t peer_pid = 0;
+#if defined(__linux__)
+  struct ucred peer_credentials;
+  socklen_t peer_size = sizeof(peer_credentials);
+  if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer_credentials, &peer_size) == 0) {
+    peer_pid = peer_credentials.pid;
+  }
+#endif
   std::shared_ptr<CompileSession> compile_session;
 
   while (ok && RecvFrame(fd, &request)) {
@@ -974,7 +999,7 @@ void Server::Serve(int fd) {
         break;
       }
       case Op::kGet: HandleGet(&in, &out); break;
-      case Op::kPut: HandlePut(&in, &out); break;
+      case Op::kPut: HandlePut(&in, &out, peer_pid); break;
       case Op::kLeaseAcquire: HandleLeaseAcquire(&in, &out, compile_session); break;
       case Op::kLeaseRelease: HandleLeaseRelease(&in, &out, compile_session); break;
       case Op::kStatus:
