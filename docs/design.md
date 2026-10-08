@@ -226,6 +226,10 @@ use a table-driven scanner. Preprocessed output uses a streaming scanner because
 it is hot: tens of megabytes per compilation, of which only lines starting with
 `#` need any work.
 
+  `vcache --test-put KEY` reads one blob from stdin and stores it through a
+  running daemon, so a test can put two values of one key while an upload is
+  still in flight. `VCACHE_TEST_MAX_HELD_BYTES` shrinks the daemon's held-blob
+  cap for that same test. Unset, the cap stays 1 GiB.
 ## Known limitations
 
 - **Preprocessor mode only.** Every compilation runs the preprocessor, even on a
