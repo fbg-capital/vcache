@@ -12,6 +12,7 @@
 #include "core/cost.h"
 #include "core/depfile.h"
 #include "core/stats.h"
+#include "daemon/client.h"
 #include "hash/hasher.h"
 #include "storage/storage.h"
 #include "util/fs.h"
@@ -340,6 +341,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
   core::RecordCounter(cache_dir, Counter::kMiss);
 
   // ---- miss: compile into a staging directory -----------------------------
+
+  auto session = daemon::DaemonClient::OpenCompileSession(config);
 
   const std::string stage_dir = *temp_dir + "/out";
   if (!util::MakeDirs(stage_dir)) return RunPassthrough(argv);

@@ -16,6 +16,7 @@
 #include "core/cost.h"
 #include "core/link_trace.h"
 #include "core/stats.h"
+#include "daemon/client.h"
 #include "hash/hasher.h"
 #include "storage/storage.h"
 #include "util/fs.h"
@@ -376,6 +377,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   opts.capture_stderr = true;
   opts.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
   opts.env.emplace_back("LD_PRELOAD", tracer);
+  auto session = daemon::DaemonClient::OpenCompileSession(config);
   util::ProcResult result = util::Run(argv, opts);
   // Same rule as a compile: a link that dies is still a sample, and -flto's
   // figure is whatever wait4 reported for the largest waited-for child.
