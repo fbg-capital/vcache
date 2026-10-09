@@ -948,7 +948,9 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
 
   auto session = daemon::DaemonClient::OpenCompileSession(config);
   if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
-    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(std::nullopt));
+    const auto cost_key = ComputeCostKey("compile", parsed.source,
+        args::LanguageName(parsed.language), parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(cache_dir, cost_key));
     if (outcome != daemon::LeaseOutcome::kCompile && try_hit()) {
       session->ReleaseLease(true);
       return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;

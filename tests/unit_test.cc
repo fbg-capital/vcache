@@ -3502,7 +3502,38 @@ void TestHeldHitLayer() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc >= 7 && std::string(argv[1]) == "--write-lease-cost-fixture") {
+    const std::string cache_dir = argv[2];
+    const auto roots = MakeRoots({argv[3]});
+    const std::string operation = argv[4];
+    util::ProcResult proc;
+    proc.wall_ms = std::strtoull(argv[5], nullptr, 10);
+    proc.max_rss_kb = 4096;
+    const std::vector<std::string> command(argv + 6, argv + argc);
+    std::string source, language;
+    std::vector<std::string> key_args;
+    if (operation == "compile") {
+      const auto parsed = args::Parse(command);
+      source = parsed.source;
+      language = args::LanguageName(parsed.language);
+      key_args = parsed.key_args;
+    } else if (operation == "rustc") {
+      const auto parsed = args::ParseRustc(command);
+      source = parsed.source;
+      language = "rust";
+      key_args = parsed.key_args;
+    } else if (operation == "link") {
+      const auto parsed = args::ParseLink(command);
+      source = parsed.output;
+      key_args = parsed.key_args;
+    } else {
+      return 2;
+    }
+    core::RecordCompileCost(cache_dir, operation, source, language, key_args, roots, proc);
+    return core::LoadCompileCost(cache_dir, core::ComputeCostKey(
+        operation, source, language, key_args, roots)).observations.empty() ? 1 : 0;
+  }
   TestStringUtils();
   TestRootMap();
   TestDepFile();

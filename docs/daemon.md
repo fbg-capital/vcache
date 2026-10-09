@@ -235,8 +235,9 @@ The seam is inactive when the variable is absent.
 
 The wait bound is the larger of twice the waiter's own recorded wall time and
 30 seconds, capped at the 300-second reply timeout. Without a usable cost record
-the bound is 30 seconds. Cost lookup is wired after the cost-record feature is
-merged. A waiter still occupies its build tool's job slot while it waits.
+the bound is 30 seconds. It uses the highest wall time in the matching cost
+record, rather than only its latest observation. A waiter still occupies its
+build tool's job slot while it waits.
 Decision logs include holder pid, bound and elapsed wait; the client receives
 this metadata with its scheduling reply. Session loss never fails the build.
 The socket receive timeout exceeds a scheduling bound by 15 seconds, allowing

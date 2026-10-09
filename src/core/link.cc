@@ -368,7 +368,9 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   }
   auto session = daemon::DaemonClient::OpenCompileSession(config);
   if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
-    const auto outcome = session->AcquireLease(pre_key, daemon::LeaseWaitBoundMs(std::nullopt));
+    const auto cost_key = ComputeCostKey("link", parsed.output, "", parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(pre_key,
+        daemon::LeaseWaitBoundMs(cache_dir, cost_key));
     if (outcome != daemon::LeaseOutcome::kCompile) {
       entries.clear();
       load_entries();

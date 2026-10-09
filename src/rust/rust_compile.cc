@@ -346,7 +346,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   auto session = daemon::DaemonClient::OpenCompileSession(config);
   if (session && config.daemon.single_flight && !config.recache && cache != nullptr) {
-    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(std::nullopt));
+    const auto cost_key = core::ComputeCostKey("rustc", parsed.source, "rust", parsed.key_args, roots);
+    const auto outcome = session->AcquireLease(key, daemon::LeaseWaitBoundMs(cache_dir, cost_key));
     if (outcome != daemon::LeaseOutcome::kCompile && try_entry_hit()) {
       session->ReleaseLease(true);
       return 0;
