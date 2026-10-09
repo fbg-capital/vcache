@@ -56,7 +56,7 @@ whose point is cross-directory hits: it maps each checkout's paths to canonical
 names (`VCACHE_ROOTS`) so one worktree's compiles hit another's. We use it as
 `RUSTC_WRAPPER` for the Rust workspaces of the sibling repos (sunbird, siren,
 launchctl, compass, devtools' `build-run`); C and C++ stay on ccache. The fork
-carries fixes and features upstream does not have yet (`git log upstream/main..main`),
+carries fixes and features upstream does not have yet (`git log upstream/main..fbg`),
 chiefly the Rust manifest mode, per-reason stats, a path-valued env-dep
 canonicalisation (`rust_path_env_vars`, used for `OUT_DIR`) and the dep-scan key fix.
 
@@ -69,21 +69,26 @@ implementing it. Check for an existing bead before inventing new work.
 | Ref | Meaning |
 |---|---|
 | `upstream/main` | Unto-Labs. Read-only for us; PRs go there only when the owner decides (commit author identity is still open). |
-| `origin/main` | **Our integration branch**: upstream main plus every merged fork feature. Builds, binaries and beads come from here. |
-| `origin/feat/*`, `origin/fix/*` | One feature branch per bead or upstream issue, branched from `origin/main`. |
-| `origin/dev` | Retired alias of main from before 2026-10-08; do not push to it. |
+| `origin/fbg` | **Our integration branch** (named `main` until 2026-10-09): upstream main plus every merged fork feature. Builds, binaries and beads come from here. |
+| `origin/feat/*`, `origin/fix/*` | One feature branch per bead or upstream issue, branched from `origin/fbg`. |
+| `origin/dev` | Head of upstream PR #25, the fix stack offered to Unto-Labs. Push to it only to update that PR, and merge what you push into `fbg`. |
+
+The fork has no `main` branch, so `main` always means upstream's. A push to `origin main`
+would recreate the old name; push `fbg`. A clone from before the rename switches with
+`git branch -m main fbg && git fetch origin && git branch -u origin/fbg fbg && git remote set-head origin -a`
+(`host-setup-buildcache.sh` does this for `~/fbg/vcache`).
 
 Workflow for a feature:
 
 ```bash
-git fetch origin upstream
-git worktree add ../vcache.wt/<slug> -b feat/<slug> origin/main   # worktrees live in ~/fbg/vcache.wt/
+git fetch --multiple origin upstream
+git worktree add ../vcache.wt/<slug> -b feat/<slug> origin/fbg   # worktrees live in ~/fbg/vcache.wt/
 # ... implement, make test ...
 git push -u origin feat/<slug>
-git checkout main && git merge --no-ff feat/<slug> && git push origin main:main
+git checkout fbg && git merge --no-ff feat/<slug> && git push origin fbg:fbg
 ```
 
-Merging a new upstream release: `git merge upstream/main` into `main` (conflicts so far
+Merging a new upstream release: `git merge upstream/main` into `fbg` (conflicts so far
 have been adjacent additions in `core/config.{h,cc}` and the test includes), run
 `make test`, then rebuild the binaries (below). Upstream issues we filed: #21, #23, #24 (the daemon scheduler proposal, epic `vcache-cug`); the
 feature requests #12–#20 are ours too.
@@ -168,7 +173,7 @@ make kernel-test                       # Linux kernel recipe, by hand only
 make clean / make distclean            # distclean also drops the fetched third-party trees
 ```
 
-Baseline on `main` after the 1.3.0 merge: **499 unit / 379 integration checks, 0 failed**.
+Baseline on `fbg` after the 1.3.0 merge: **499 unit / 379 integration checks, 0 failed**.
 Any PR must keep both at zero failures.
 
 - Unit tests: one `Section("...")` per area, `Check(cond, "what")` / `CheckEq(actual,
@@ -182,10 +187,10 @@ Any PR must keep both at zero failures.
 ### Installed binaries
 
 The repos consume `~/fbg/vcache/dist/{host,el10,dc-build}/vcache`, not `bin/`. Rebuild
-all three from `main` with
+all three from `fbg` with `git -C ~/fbg/vcache pull --ff-only` and then
 `~/fbg/devtools/scripts/host-setup-buildcache.sh --force` (host build here; el10 and
 dc-build from a `git archive` of HEAD inside the images; the old binary is kept as
-`vcache.prev`). Stores live under `/build/<user>/cache/vcache/<os>`; `--show-stats` needs
+`vcache.prev`). The script builds whatever `~/fbg/vcache` has checked out; it does not pull. Stores live under `/build/<user>/cache/vcache/<os>`; `--show-stats` needs
 `VCACHE_DIR` and the same `VCACHE_CACHE_SIZE` the builds use, or a running daemon refuses
 the client.
 
@@ -197,7 +202,7 @@ the client.
 - **`/usr/lib64/ccache` on `PATH` hangs `make test`**: ccache's masquerade symlinks loop
   with vcache's own compiler-wrapper probe. Strip it from `PATH` for test runs.
 - A fresh worktree has no `third-party/gperftools`: run `third-party/fetch.sh` (or symlink
-  the main checkout's `third-party/`) before `make`.
+  the primary checkout's `third-party/`) before `make`.
 - `pch_external_checksum`, `base_dir` and `sloppiness` are **ccache** settings seen in the
   sibling repos; vcache has no equivalents and declines `-fpch-preprocess`, `-fmodules`
   and `.incbin` on purpose (`docs/design.md`).
@@ -216,5 +221,5 @@ the client.
 1. **Check status**: `git status` and `git diff`.
 2. **Run the gate**: `make test` on the branch you will push.
 3. **Commit** (see "Commit messages"), including `.beads/issues.jsonl` when beads changed.
-4. **Push** the feature branch; merge to `main` with `--no-ff` and push `main:main`.
+4. **Push** the feature branch; merge to `fbg` with `--no-ff` and push `fbg:fbg`.
 5. **Rebuild `dist/`** if a merged change ends with `Deploy: vcache`.
