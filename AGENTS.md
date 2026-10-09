@@ -68,7 +68,7 @@ implementing it. Check for an existing bead before inventing new work.
 
 | Ref | Meaning |
 |---|---|
-| `upstream/main` | Unto-Labs. Read-only for us; PRs go there only when the owner decides (commit author identity is still open). |
+| `upstream/main` | Unto-Labs. Read-only for us; PRs go there only when the owner decides (commit author identity is still open). The local `main` tracks it; never commit on it. |
 | `origin/fbg` | **Our integration branch** (named `main` until 2026-10-09): upstream main plus every merged fork feature. Builds, binaries and beads come from here. |
 | `origin/feat/*`, `origin/fix/*` | One feature branch per bead or upstream issue, branched from `origin/fbg`. |
 | `origin/dev` | Head of upstream PR #25, the fix stack offered to Unto-Labs. Push to it only to update that PR, and merge what you push into `fbg`. |
@@ -76,7 +76,9 @@ implementing it. Check for an existing bead before inventing new work.
 The fork has no `main` branch, so `main` always means upstream's. A push to `origin main`
 would recreate the old name; push `fbg`. A clone from before the rename switches with
 `git branch -m main fbg && git fetch origin && git branch -u origin/fbg fbg && git remote set-head origin -a`
-(`host-setup-buildcache.sh` does this for `~/fbg/vcache`).
+(`host-setup-buildcache.sh` does this for `~/fbg/vcache`), then mirrors upstream with
+`git branch --track main upstream/main`. We never push to `upstream`; set
+`git remote set-url --push upstream no-push://upstream-is-read-only` so a push fails.
 
 Workflow for a feature:
 
