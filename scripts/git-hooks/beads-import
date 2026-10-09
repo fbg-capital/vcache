@@ -9,6 +9,7 @@
 # stale form back over it. `--rebuild` treats the file as authoritative; it runs only when no
 # unexported local edit exists and the working file is the committed one, so nothing is lost.
 hook=${1:-beads-import}
+command -v br >/dev/null 2>&1 || exit 0
 
 dirty=$(br sync --status 2>/dev/null | sed -n 's/^ *Dirty issues: *\([0-9]*\).*/\1/p')
 if [[ "$dirty" == "0" ]] && git diff --quiet HEAD -- .beads/issues.jsonl 2>/dev/null; then

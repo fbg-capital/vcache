@@ -5,6 +5,8 @@
 GIT_ROOT=$(git rev-parse --show-toplevel) || exit 0
 cd "$GIT_ROOT" || exit 0
 [[ -f .beads/issues.jsonl ]] || exit 0
+# No br on PATH (a host without beads, or a non-login shell): nothing to import, and nothing to warn about.
+command -v br >/dev/null 2>&1 || exit 0
 
 if git rev-parse -q --verify ORIG_HEAD >/dev/null 2>&1 && git diff --quiet ORIG_HEAD HEAD -- .beads/issues.jsonl; then
     exit 0
