@@ -127,6 +127,11 @@ lines carry timestamps but there is no span around the restore itself, so add a
 "restored N files, M bytes, T ms" log line first, then run a clean `cargo build` of a
 large workspace with the log on, before and after each step.
 
+Measured after step 1 (`docs/design.md`, "Restoring outputs"): a warm dev-profile build
+of sunbird's root workspace restores 4,801 MiB in 341 hits. With the fsync it took
+6.4 s wall and 37.2 s summed over the restore writes; without, 3.6 s wall, 1.2 s in
+the writes and 5.7 s from lookup to placement.
+
 ## 5. Step 1: no fsync on restored outputs
 
 `RestoreOutputs` and `MaterializeHit` pass `durable = false` to `WriteFileAtomic`. The
