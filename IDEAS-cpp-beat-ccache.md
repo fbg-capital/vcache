@@ -180,8 +180,11 @@ consumes a PCH should see what the PCH saw. Owner's call in the sunbird repo.
 **Gain.** About 3.7 s of the 5 s gap in case 2 (last PCH at 3.1 s instead of 6.8 s), and
 a shorter critical path in cases 1 and 3.
 
-**Tests.** A PCH built in worktree A is restored in B and accepted by clang; a PCH built
-with timestamps on is declined; `.vcache-key` changes when a header the PCH includes
+**Tests.** A PCH is reusable only at the paths that built it: on clang 22 it records the
+absolute path of every input, even one given relatively, and refuses to load once one is
+missing ("could not find file ... referenced by AST file"), so the key holds the raw cwd
+and argv, a rebuild of the same tree is restored and accepted by clang, and tree B at
+another path misses; a PCH built with timestamps on is declined; `.vcache-key` changes when a header the PCH includes
 changes or when the PCH's `-D` set changes.
 
 ### 5.2 Manifest mode for C and C++ (was 4.3; ccache's depend mode, done soundly)
