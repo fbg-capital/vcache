@@ -130,6 +130,23 @@ fail by design).
   without an include guard was re-read and failed, so the guard state the PCH carries
   decides it.
 
+### 2.6 After 5.0 and 5.1 landed (sunbird `ccc1a6f26`, fbg `78e4a49`, el10, 2026-10-11)
+
+Two fresh worktrees at the fixed sunbird commit, `all all_tests`, daemon off, store A
+filled by worktree A's clean build, then worktree B's clean build against it.
+
+| Case | Wall | Children CPU user / sys | Stats |
+| --- | --- | --- | --- |
+| 1. Cold, worktree A | 41.0 s | 11m59s / 44s | 473 misses, 0 preprocess failures |
+| 2. Warm, worktree B from store A | **10.5 s** (10.6 s single flight) | 1m14s / 23s | 473 hits, 0 misses |
+
+Against 19.5 s before (section 2.1) and 10-12 s with the include fix alone (section 2.2).
+The 16 PCH builds (8 per `all`/`all_tests` pass) are hits of 0.3-0.9 s instead of 1.7-2.1 s
+builds, and the last one finishes at 5.3 s because it waits on wiregen and its consumers'
+dependencies, not on vcache. The build's tail is the uncached test links (last edge at
+10.6 s). ccache's 5.3-7.8 s (section 2.1) is the remaining target; the per-hit cost of
+section 2.3 is what is left, which is 5.2.
+
 ## 3. Small wins landed on `fbg` (section 2.3 and 2.4 costs)
 
 1. `cd00cc8` perf(core): the preprocessed text is hashed in 256 KiB batches with
@@ -157,12 +174,17 @@ fail by design).
 
 ### 5.0 sunbird: give the PCH consumers the PCH's include path (no vcache code)
 
+**Landed**: sunbird `ccc1a6f26` links `nlohmann_json` (and GTest for the test tier) into every
+REUSE_FROM consumer; 168 of 438 consumers lacked the path before, 0 after.
+
 The 164 failing consumers lack `-isystem /opt/infra/3rdparty/release.clang22/include`,
 which every PCH producer has. Adding it to the consumer targets halves vcache's warm time
 (section 2.2) and changes nothing for ccache. It is also the correct build: a target that
 consumes a PCH should see what the PCH saw. Owner's call in the sunbird repo.
 
 ### 5.1 Cache the PCH builds (was 4.2; now the largest gain)
+
+**Landed**: fbg `8522db9`. Section 2.6 has the numbers.
 
 **What.** Accept `-x c++-header` / `-x c-header` compiles whose output is `.pch` or `.gch`
 (and clang's `-emit-pch`), keyed like any compile from the preprocessed header.
