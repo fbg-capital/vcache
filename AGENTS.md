@@ -208,9 +208,11 @@ the client.
 - `pch_external_checksum`, `base_dir` and `sloppiness` are **ccache** settings seen in the
   sibling repos; vcache has no equivalents and declines `-fpch-preprocess`, `-fmodules`
   and `.incbin` on purpose (`docs/design.md`).
-- The daemon (`VCACHE_DAEMON=auto`) is off in every repo's `vcache-env.sh`: on a
-  disk-only cache it measured no gain, and clients whose cache settings differ are
-  refused silently (upstream #23).
+- The daemon is on by default: `exportVcacheEnv` in `~/fbg/devtools/scripts/vcache-env.sh`
+  exports `VCACHE_DAEMON=auto` (unless already set) and `VCACHE_DAEMON_SINGLE_FLIGHT=1`, so
+  concurrent checkouts compile each missed key once (`docs/daemon.md`, Results).
+  `FBG_VCACHE_SINGLE_FLIGHT=0` leaves it off. A client whose cache settings differ from the
+  running daemon's is refused silently (upstream #23).
 - `docs/design.md` lags the code in places (it says linking is uncached; `RunLink`
   exists); treat the code as the baseline and fix the doc in the same change.
 - The `br` destructive-command guard pattern-matches bead and commit text: avoid the
