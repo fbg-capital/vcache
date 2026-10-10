@@ -120,8 +120,10 @@ fail by design).
   lists neither the `.gch` nor its header. A manifest must add the PCH from the command line.
 - The ccache manual: direct mode "can't check with 100% accuracy if the existence of a new
   header file should invalidate the result". It does not handle shadowing.
-- A clang PCH built with `-fno-pch-timestamp` (sunbird sets it) restored into another tree
-  with touched headers is accepted. gcc `.gch` bytes differ between identical builds.
+- A clang PCH records the absolute path of every input, even one given relatively, and
+  refuses to load once one is missing; with `-fno-pch-timestamp` (sunbird sets it) it checks
+  only their sizes, so a restored copy is accepted at the same paths after a touch. gcc
+  `.gch` bytes differ between identical builds.
 - A `.gch` built once and used by a consumer compiles fine without the header's include
   paths; so does clang with `-include-pch` alone. CMake's form adds a textual `-include` of
   the header after `-include-pch`; sunbird's consumers compile with it, while a test header
