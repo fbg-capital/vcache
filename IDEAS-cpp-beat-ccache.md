@@ -137,10 +137,11 @@ fail by design).
    are written without fsync; cache entries and memos keep it. About 4 ms per C++ hit, 6 ms
    per Rust hit.
    Hit, min of 60 runs: clang++ 83 → 70 ms, g++ 97 → 86 ms.
-3. In progress on `perf/extern-memo`: digests of `--extern` files memoised by device,
-   inode, size, mtime and ctime under `<cache_dir>/filehash/`, swept by trim. Expected to
-   remove most of the 37 ms per Rust hit. Same branch fixes a defect found on the way: a
-   `-MD` compile that hits an entry stored without `-MD` wrote no depfile.
+3. `6777382` perf(rust): digests of `--extern` files memoised by device, inode, size,
+   mtime and ctime under `<cache_dir>/filehash/`, swept by `--trim` after 30 days. The
+   feedreplay hit: about 45 ms to about 9 ms of vcache time.
+4. `403b27d` fix(core): a `-MD` compile that hits an entry stored without `-MD` now
+   recompiles and stores the depfile; before, it wrote no depfile and counted as a hit.
 
 ## 4. What stays as it is
 
