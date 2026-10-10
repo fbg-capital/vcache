@@ -139,8 +139,11 @@ filled by worktree A's clean build, then worktree B's clean build against it.
 | --- | --- | --- | --- |
 | 1. Cold, worktree A | 41.0 s | 11m59s / 44s | 473 misses, 0 preprocess failures |
 | 2. Warm, worktree B from store A | **10.5 s** (10.6 s single flight) | 1m14s / 23s | 473 hits, 0 misses |
+| 2. Warm, worktree B, after 5.2 (fbg `a55fc57`) | **8.6 s**; 8.0 s on its second run; **6.9 s** with the daemon | 27s / 16s | 473 hits, all manifest hits, 0 preprocessor runs |
 
-Against 19.5 s before (section 2.1) and 10-12 s with the include fix alone (section 2.2).
+Against 19.5 s before (section 2.1), 10-12 s with the include fix alone (section 2.2), and
+ccache's 5.3-7.8 s (section 2.1). With manifest mode the warm build runs no preprocessor at
+all, and its children CPU (27 s) is below ccache's whole-build CPU (36 s).
 The 16 PCH builds (8 per `all`/`all_tests` pass) are hits of 0.3-0.9 s instead of 1.7-2.1 s
 builds, and the last one finishes at 5.3 s because it waits on wiregen and its consumers'
 dependencies, not on vcache. The build's tail is the uncached test links (last edge at
@@ -212,6 +215,9 @@ another path misses; a PCH built with timestamps on is declined; `.vcache-key` c
 changes or when the PCH's `-D` set changes.
 
 ### 5.2 Manifest mode for C and C++ (was 4.3; ccache's depend mode, done soundly)
+
+**Landed**: fbg `a55fc57` (`55621ad` plus the review fixes `6acdf5a`, `d90bb38`, `f20884e`).
+Section 2.6 has the numbers; host hit cost fell from 69/88 ms to 6/9 ms (clang/gcc).
 
 **Landed** on `feat/cxx-manifest` as `cxx_manifest` (default on, `VCACHE_CXX_MANIFEST`).
 What was built, against the plan below:
