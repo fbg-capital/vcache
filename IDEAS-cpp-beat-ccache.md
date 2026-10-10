@@ -120,13 +120,32 @@ fail by design).
   lists neither the `.gch` nor its header. A manifest must add the PCH from the command line.
 - The ccache manual: direct mode "can't check with 100% accuracy if the existence of a new
   header file should invalidate the result". It does not handle shadowing.
-- A clang PCH built with `-fno-pch-timestamp` (sunbird sets it) restored into another tree
-  with touched headers is accepted. gcc `.gch` bytes differ between identical builds.
+- A clang PCH records the absolute path of every input, even one given relatively, and
+  refuses to load once one is missing; with `-fno-pch-timestamp` (sunbird sets it) it checks
+  only their sizes, so a restored copy is accepted at the same paths after a touch. gcc
+  `.gch` bytes differ between identical builds.
 - A `.gch` built once and used by a consumer compiles fine without the header's include
   paths; so does clang with `-include-pch` alone. CMake's form adds a textual `-include` of
   the header after `-include-pch`; sunbird's consumers compile with it, while a test header
   without an include guard was re-read and failed, so the guard state the PCH carries
   decides it.
+
+### 2.6 After 5.0 and 5.1 landed (sunbird `ccc1a6f26`, fbg `78e4a49`, el10, 2026-10-11)
+
+Two fresh worktrees at the fixed sunbird commit, `all all_tests`, daemon off, store A
+filled by worktree A's clean build, then worktree B's clean build against it.
+
+| Case | Wall | Children CPU user / sys | Stats |
+| --- | --- | --- | --- |
+| 1. Cold, worktree A | 41.0 s | 11m59s / 44s | 473 misses, 0 preprocess failures |
+| 2. Warm, worktree B from store A | **10.5 s** (10.6 s single flight) | 1m14s / 23s | 473 hits, 0 misses |
+
+Against 19.5 s before (section 2.1) and 10-12 s with the include fix alone (section 2.2).
+The 16 PCH builds (8 per `all`/`all_tests` pass) are hits of 0.3-0.9 s instead of 1.7-2.1 s
+builds, and the last one finishes at 5.3 s because it waits on wiregen and its consumers'
+dependencies, not on vcache. The build's tail is the uncached test links (last edge at
+10.6 s). ccache's 5.3-7.8 s (section 2.1) is the remaining target; the per-hit cost of
+section 2.3 is what is left, which is 5.2.
 
 ## 3. Small wins landed on `fbg` (section 2.3 and 2.4 costs)
 
@@ -155,12 +174,17 @@ fail by design).
 
 ### 5.0 sunbird: give the PCH consumers the PCH's include path (no vcache code)
 
+**Landed**: sunbird `ccc1a6f26` links `nlohmann_json` (and GTest for the test tier) into every
+REUSE_FROM consumer; 168 of 438 consumers lacked the path before, 0 after.
+
 The 164 failing consumers lack `-isystem /opt/infra/3rdparty/release.clang22/include`,
 which every PCH producer has. Adding it to the consumer targets halves vcache's warm time
 (section 2.2) and changes nothing for ccache. It is also the correct build: a target that
 consumes a PCH should see what the PCH saw. Owner's call in the sunbird repo.
 
 ### 5.1 Cache the PCH builds (was 4.2; now the largest gain)
+
+**Landed**: fbg `8522db9`. Section 2.6 has the numbers.
 
 **What.** Accept `-x c++-header` / `-x c-header` compiles whose output is `.pch` or `.gch`
 (and clang's `-emit-pch`), keyed like any compile from the preprocessed header.
@@ -180,8 +204,11 @@ consumes a PCH should see what the PCH saw. Owner's call in the sunbird repo.
 **Gain.** About 3.7 s of the 5 s gap in case 2 (last PCH at 3.1 s instead of 6.8 s), and
 a shorter critical path in cases 1 and 3.
 
-**Tests.** A PCH built in worktree A is restored in B and accepted by clang; a PCH built
-with timestamps on is declined; `.vcache-key` changes when a header the PCH includes
+**Tests.** A PCH is reusable only at the paths that built it: on clang 22 it records the
+absolute path of every input, even one given relatively, and refuses to load once one is
+missing ("could not find file ... referenced by AST file"), so the key holds the raw cwd
+and argv, a rebuild of the same tree is restored and accepted by clang, and tree B at
+another path misses; a PCH built with timestamps on is declined; `.vcache-key` changes when a header the PCH includes
 changes or when the PCH's `-D` set changes.
 
 ### 5.2 Manifest mode for C and C++ (was 4.3; ccache's depend mode, done soundly)
