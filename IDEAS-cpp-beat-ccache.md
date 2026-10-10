@@ -186,6 +186,43 @@ changes or when the PCH's `-D` set changes.
 
 ### 5.2 Manifest mode for C and C++ (was 4.3; ccache's depend mode, done soundly)
 
+**Landed** on `feat/cxx-manifest` as `cxx_manifest` (default on, `VCACHE_CXX_MANIFEST`).
+What was built, against the plan below:
+- The include set comes from the compile's depfile (`-MD`; vcache adds
+  `-MD -MF <scratch> -MT <output>` when the build passes no dependency flags, which a
+  test shows leaves the object byte-identical). `-MMD` keeps to the preprocessor, since
+  it drops system headers. The tracer variant is not built; the shadowing hole is
+  documented in `docs/design.md` and filed as a follow-up.
+- The manifest key: compiler, native target, roots, canonical cwd and source path,
+  source digest, the whole command line canonicalised (`-I`/`-D`/`-include` kept, joined
+  `-I/abs` canonicalised), keyed files, `hash_env_vars`, `CPATH` and siblings, and each
+  PCH's identity: `<pch>.sum`, else `<pch>.vcache-key` (each only when not older than
+  the PCH), else the PCH bytes through the file-identity memo.
+- The result key is the preprocessor key when `-E` succeeds, so both modes share
+  entries. When `-E` fails with a compiler error, the result key is derived from the
+  manifest key and the state's digests; the PCH consumers of section 2.2 become
+  cacheable without 5.0.
+- Declined states: a time macro in any recorded file, a recorded file changed after
+  the compile started, and under gcc a `.gch` an `#include` could reach that the key
+  does not cover (gcc lists neither it nor its header in the depfile).
+- Verification hashes every recorded file through `HashFileMemoized`.
+- `--show-stats` has a `manifest hits` row (Rust dep-info manifest hits count there too).
+
+Hit cost on the host for `src/daemon/server.cc` (about 410 headers), 30 runs each,
+min / mean wall ms:
+
+| | `a433d2a` | preprocessor mode | manifest mode |
+| --- | --- | --- | --- |
+| clang++ 22 | 68.7 / 98.4 | 69.9 / 89.4 | 6.3 / 9.1 |
+| g++ 16 | 87.9 / 95.0 | 88.6 / 97.2 | 9.4 / 11.8 |
+
+Not built: recording a state on a preprocessor hit. A TU whose manifest key has no
+matching state but whose preprocessor key hits (a comment-only header edit, a clang PCH
+rebuilt with new bytes and no `.sum`, an entry a preprocessor-mode tree stored) keeps
+preprocessing until its next miss. Filed as a follow-up.
+
+The plan as written before the work:
+
 **What.** Before preprocessing, look up a manifest keyed on the source digest, the
 canonical flags, the compiler identity, roots, and the digest of every keyed file (the
 PCH among them). Each manifest state lists the files an earlier run read, with digests; a
