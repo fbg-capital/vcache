@@ -225,24 +225,27 @@ on, `VCACHE_CXX_MANIFEST_TRACE`). The recording compile runs under `vcache-fstra
 a state keeps the depfile's files plus what the trace saw the compiler open, and the
 paths it probed and did not find (a new `absent` line kind, `vcache-cxxmanifest-2`).
 A lookup rejects a state when one of those paths now exists, one `lstat` each. The
-compiler's installation (each executable's prefix, `/usr` here) and the shared objects
-it loads are left to the compiler fingerprint. Each absent path is stored as its highest
-missing ancestor, which takes gcc's list for `server.cc` from 1964 paths to 484. With the
-trace the gcc `__has_include` and unkeyed-`.gch` declines go: both are seen. Host,
+compiler's executables, the shared objects they load and its own trees (`lib*/gcc`,
+`libexec/gcc`, `lib/clang`) outside every include directory are left to the compiler
+fingerprint; `/usr/include` and `/usr/local/include` stay checked, since packages change
+them. The trace is used only when it shows every depfile file being read, so a compiler
+process that did not load the tracer falls back to the depfile and its declines. Each
+absent path is stored as its highest missing ancestor below the roots. With the trace the
+gcc `__has_include` and unkeyed-`.gch` declines go: both are seen. Host,
 `src/daemon/server.cc` at `-O0`, interleaved with the commit before, 30 runs, min /
-median wall ms:
+median wall ms (the second review's fixes measured; the load average was 11-31):
 
 | | absent paths | hit before | hit after | miss before | miss after |
 | --- | --- | --- | --- | --- | --- |
-| clang++ 22 | 535 | 6.1 / 7.8 | 6.6 / 8.0 | 1241 / 1468 | 1373 / 1478 |
-| g++ 16 | 484 | 7.2 / 22.0 | 7.4 / 23.0 | 1859 / 1982 | 1834 / 2035 |
+| clang++ 22 | 902 | 5.7 / 6.7 | 6.1 / 7.1 | 1148 / 1260 | 1181 / 1261 |
+| g++ 16 | 1091 | 5.0 / 6.4 | 5.9 / 7.3 | 1506 / 1671 | 1561 / 1683 |
 
 The miss columns are within the host's run-to-run spread; the record step alone (the
-caller's depfile written to the object entry written, under strace, min of 10) went
-from 12.6 to 13.5 ms (clang++) and 15.3 to 15.0 ms (g++). `src/core/depfile.cc` (Boost,
-1251 files) under g++ was declined before for Boost's `__has_include`, and hit through
-the preprocessor in 290.5 ms; it now records a state (495 absent paths) and hits in
-9.8 ms (median 11.5). `-MD` stays on the recording compile: it costs nothing measurable
+caller's depfile written to the object entry written, under strace, min of 10, measured
+before the review fixes) went from 12.6 to 13.5 ms (clang++) and 15.3 to 15.0 ms (g++).
+`src/core/depfile.cc` (Boost, 1270 files) under g++ was declined before for Boost's
+`__has_include`, and hit through the preprocessor in 249.5 ms; it now records a state
+(968 absent paths) and hits in 9.1 ms (median 10.9). `-MD` stays on the recording compile: it costs nothing measurable
 (g++ 1398 against 1351 ms min with it, clang++ 1156 against 1141, interleaved) and it is
 what tells a header from the compiler's own files.
 
