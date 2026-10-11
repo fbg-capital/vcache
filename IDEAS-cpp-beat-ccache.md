@@ -233,19 +233,19 @@ process that did not load the tracer falls back to the depfile and its declines.
 absent path is stored as its highest missing ancestor below the roots. With the trace the
 gcc `__has_include` and unkeyed-`.gch` declines go: both are seen. Host,
 `src/daemon/server.cc` at `-O0`, interleaved with the commit before, 30 runs, min /
-median wall ms (the second review's fixes measured; the load average was 11-31):
+median wall ms, measured on the branch's final tree against `7ce0d77` (load average 3-6):
 
 | | absent paths | hit before | hit after | miss before | miss after |
 | --- | --- | --- | --- | --- | --- |
-| clang++ 22 | 902 | 5.7 / 6.7 | 6.1 / 7.1 | 1148 / 1260 | 1181 / 1261 |
-| g++ 16 | 1091 | 5.0 / 6.4 | 5.9 / 7.3 | 1506 / 1671 | 1561 / 1683 |
+| clang++ 22 | 902 | 5.5 / 6.7 | 6.1 / 7.5 | 1210 / 1245 | 1215 / 1269 |
+| g++ 16 | 1091 | 5.8 / 6.7 | 5.9 / 7.4 | 1628 / 1691 | 1568 / 1702 |
 
 The miss columns are within the host's run-to-run spread; the record step alone (the
 caller's depfile written to the object entry written, under strace, min of 10, measured
 before the review fixes) went from 12.6 to 13.5 ms (clang++) and 15.3 to 15.0 ms (g++).
 `src/core/depfile.cc` (Boost, 1270 files) under g++ was declined before for Boost's
-`__has_include`, and hit through the preprocessor in 249.5 ms; it now records a state
-(968 absent paths) and hits in 9.1 ms (median 10.9). `-MD` stays on the recording compile: it costs nothing measurable
+`__has_include`, and hit through the preprocessor in 291.5 ms (median 299.7); it now
+records a state (968 absent paths) and hits in 10.1 ms (median 11.5). `-MD` stays on the recording compile: it costs nothing measurable
 (g++ 1398 against 1351 ms min with it, clang++ 1156 against 1141, interleaved) and it is
 what tells a header from the compiler's own files.
 
