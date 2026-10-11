@@ -310,7 +310,14 @@ which re-reads the current disk value, would ship a sidecar entry to the remote.
 
 **Threshold.** 8 MiB covers 66% of the bytes in the measured store with 1,085 files,
 9% of the output files. 1 MiB would cover 98% with 4,589 files, and the trimmer stats
-every file on every walk. Start at 8 MiB as one constant, labelled provisional.
+every file on every walk. Started at 8 MiB as one constant, labelled provisional.
+Measured afterwards at 1, 2, 4, 8, 16 and 32 MiB (`docs/design.md`, "Restoring
+outputs"): 1 to 4 MiB form one group at about 4 s per warm build, 8 MiB and above
+another at about 7 s, and the trim walk stayed under 35 ms at every threshold. The
+constant is now 4 MiB: the whole measured gain with the fewest files that the trimmer
+can evict apart from their entry (section 9, limit 1). A threshold change needs no key
+bump; a reader handles inline and sidecar files in the same entry whichever binary
+wrote it.
 
 **Where sidecars apply.** Only when `config.disk.enabled` is true and `config.s3.enabled`
 is false. The test is on the config, not on the process's `CacheChain`: with the daemon
