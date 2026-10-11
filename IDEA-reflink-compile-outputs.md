@@ -118,6 +118,10 @@ rename. The reflink row is the clone alone; a step 3 hit also hashes the file (b
 be, warm and cold, before step 3's gain is quoted: a step 3 hit is one hash plus one
 clone, so the "0.00 s" row is not the hit.
 
+Measured after step 3 on the largest sidecar in a scratch store of a sunbird dev build
+(1,056 MiB): 0.13–0.15 s warm, 0.36–0.38 s with its pages dropped first, three runs
+each (`docs/design.md`, "Restoring outputs").
+
 Under parallel load, which is how the memory-limited build slice runs, the fsync is
 half the cost and the copy is the other half. Step 1 takes the first half with a
 one-line change per call site; steps 2 and 3 take the copy and the memory.
@@ -126,6 +130,11 @@ Not measured: how much of a real clean build's wall time goes to restoring. `VCA
 lines carry timestamps but there is no span around the restore itself, so add a
 "restored N files, M bytes, T ms" log line first, then run a clean `cargo build` of a
 large workspace with the log on, before and after each step.
+
+Measured after step 1 (`docs/design.md`, "Restoring outputs"): a warm dev-profile build
+of sunbird's root workspace restores 4,801 MiB in 341 hits. With the fsync it took
+6.4 s wall and 37.2 s summed over the restore writes; without, 3.6 s wall, 1.2 s in
+the writes and 5.7 s from lookup to placement.
 
 ## 5. Step 1: no fsync on restored outputs
 
