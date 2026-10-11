@@ -199,8 +199,9 @@ consumes a PCH should see what the PCH saw. Owner's call in the sunbird repo.
   specific; the compiler identity in the key covers it.
 - Store the PCH bytes as the entry and restore through the reflink path of
   `IDEA-reflink-compile-outputs.md` (tens of MB per PCH).
-- Write `<pch>.vcache-key` beside the output: the PCH's own cache key (compiler, flags,
-  preprocessed header text). 5.2 reads it where a build writes no `.sum`.
+- Write `<pch>.vcache-key` beside the output: a digest of the PCH's inputs with paths
+  canonicalised (compiler, flags, `-dD` header text), the same in every worktree, unlike
+  the entry's key. 5.2 reads it where a build writes no `.sum`.
 - The integration test at `tests/integration_test.sh:3545` asserts "clang PCH generation
   is declined" and flips.
 
