@@ -220,13 +220,38 @@ changes or when the PCH's `-D` set changes.
 **Landed**: fbg `a55fc57` (`55621ad` plus the review fixes `6acdf5a`, `d90bb38`, `f20884e`).
 Section 2.6 has the numbers; host hit cost fell from 69/88 ms to 6/9 ms (clang/gcc).
 
+**Tracer variant landed** on `feat/cxx-manifest-trace` as `cxx_manifest_trace` (default
+on, `VCACHE_CXX_MANIFEST_TRACE`). The recording compile runs under `vcache-fstrace.so`;
+a state keeps the depfile's files plus what the trace saw the compiler open, and the
+paths it probed and did not find (a new `absent` line kind, `vcache-cxxmanifest-2`).
+A lookup rejects a state when one of those paths now exists, one `lstat` each. The
+compiler's installation (each executable's prefix, `/usr` here) and the shared objects
+it loads are left to the compiler fingerprint. Each absent path is stored as its highest
+missing ancestor, which takes gcc's list for `server.cc` from 1964 paths to 484. With the
+trace the gcc `__has_include` and unkeyed-`.gch` declines go: both are seen. Host,
+`src/daemon/server.cc` at `-O0`, interleaved with the commit before, 30 runs, min /
+median wall ms:
+
+| | absent paths | hit before | hit after | miss before | miss after |
+| --- | --- | --- | --- | --- | --- |
+| clang++ 22 | 535 | 6.1 / 7.8 | 6.6 / 8.0 | 1241 / 1468 | 1373 / 1478 |
+| g++ 16 | 484 | 7.2 / 22.0 | 7.4 / 23.0 | 1859 / 1982 | 1834 / 2035 |
+
+The miss columns are within the host's run-to-run spread; the record step alone (the
+caller's depfile written to the object entry written, under strace, min of 10) went
+from 12.6 to 13.5 ms (clang++) and 15.3 to 15.0 ms (g++). `src/core/depfile.cc` (Boost,
+1251 files) under g++ was declined before for Boost's `__has_include`, and hit through
+the preprocessor in 290.5 ms; it now records a state (495 absent paths) and hits in
+9.8 ms (median 11.5). `-MD` stays on the recording compile: it costs nothing measurable
+(g++ 1398 against 1351 ms min with it, clang++ 1156 against 1141, interleaved) and it is
+what tells a header from the compiler's own files.
+
 **Landed** on `feat/cxx-manifest` as `cxx_manifest` (default on, `VCACHE_CXX_MANIFEST`).
 What was built, against the plan below:
 - The include set comes from the compile's depfile (`-MD`; vcache adds
   `-MD -MF <scratch> -MT <output>` when the build passes no dependency flags, which a
   test shows leaves the object byte-identical). `-MMD` keeps to the preprocessor, since
-  it drops system headers. The tracer variant is not built; the shadowing hole is
-  documented in `docs/design.md` and filed as a follow-up.
+  it drops system headers. The tracer variant came later (above).
 - The manifest key: compiler, native target, roots, canonical cwd and source path,
   source digest, the whole command line canonicalised (`-I`/`-D`/`-include` kept, joined
   `-I/abs` canonicalised), keyed files, `hash_env_vars`, `CPATH` and siblings, and each
