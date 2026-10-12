@@ -255,8 +255,8 @@ source after the trace. Where a compile has no tracer (`cxx_manifest_trace = fal
 `vcache-fstrace.so`, `LD_PRELOAD` inherited, another platform), a compiler whose `-v` ends
 in `absent-deps-1` (the devtools gcc and clang patch) records its state from
 `-fabsent-deps=<scratch>/absent` beside the `-MD` vcache adds: the depfile gives the files
-(less a keyed PCH, which the patched depfile names; an unkeyed `.gch` there is hashed but
-not scanned for time macros), the list the absent paths, stored through the roots as the
+(less a keyed PCH, which the patched depfile names; an unkeyed `.gch` there declines, as
+its header's time macros are out of sight), the list the absent paths, stored through the roots as the
 highest missing ancestor. A listed path that exists declines the state. The trace stays
 first because the list is not cheaper (below) and misses what the driver reads and probes. Host, `src/daemon/server.cc` at `-O0`, 30 interleaved runs, min /
 median wall ms, `/opt/infra.el10/bin/g++-16` (16.2.0) and the scratch patched clang++ 22.1.8,
