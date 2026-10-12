@@ -249,6 +249,31 @@ records a state (968 absent paths) and hits in 10.1 ms (median 11.5). `-MD` stay
 (g++ 1398 against 1351 ms min with it, clang++ 1156 against 1141, interleaved) and it is
 what tells a header from the compiler's own files.
 
+**Compiler-list variant landed** on `feat/cxx-manifest-absent-deps` as
+`cxx_manifest_absent_deps` (default on, `VCACHE_CXX_MANIFEST_ABSENT_DEPS`). A compiler whose
+`-v` ends in `absent-deps-1` (the devtools gcc and clang patch) records its state from
+`-fabsent-deps=<scratch>/absent` beside the `-MD` vcache adds, with no tracer: the depfile
+gives the files (less a keyed PCH, which the patched depfile names), the list the absent
+paths, stored through the roots as the highest missing ancestor. A listed path that exists
+declines the state. Host, `src/daemon/server.cc` at `-O0`, 30 interleaved runs, min /
+median wall ms, `/opt/infra.el10/bin/g++-16` (16.2.0) and the scratch patched clang++ 22.1.8,
+load average 20-32 from other work:
+
+| | absent paths list / trace | hit list | hit trace | miss list | miss trace |
+| --- | --- | --- | --- | --- | --- |
+| clang++ 22 | 1202 / 937 | 5.2 / 7.6 | 4.3 / 7.6 | 1616 / 1956 | 1536 / 1988 |
+| g++ 16 | 1578 / 1582 | 5.0 / 7.7 | 5.1 / 7.9 | 2058 / 2495 | 2085 / 2522 |
+
+`src/core/depfile.cc` (Boost, 1270 files) under g++ 16: 1324 / 1328 absent paths, hit 8.9 /
+52.1 (list) against 8.8 / 50.5 (trace), miss 1581 / 2055 against 1685 / 2093. Neither path
+is measurably cheaper at this load: the miss medians favour the list by 1-2 %, the hits are
+level. The list is chosen for what it removes (`LD_PRELOAD`, the trace log and its parse,
+ld.so refusals), not for speed. g++'s list matches its trace but for four driver probes
+(`as`, `specs`). clang's list holds 313 paths spelled through `..`
+(`.../16/../../../../include/c++/16/asm/...`), which are kept as probed and do not collapse to
+a missing ancestor, and lacks what the trace saw the driver do: its `.cfg` probes, the GCC
+installation it detected (`crtbegin.o`) and `/etc/os-release`.
+
 **Landed** on `feat/cxx-manifest` as `cxx_manifest` (default on, `VCACHE_CXX_MANIFEST`).
 What was built, against the plan below:
 - The include set comes from the compile's depfile (`-MD`; vcache adds
