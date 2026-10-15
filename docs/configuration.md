@@ -129,7 +129,8 @@ timeout        = 30                # seconds
 | — | `AWS_SESSION_TOKEN` | — | — |
 | — | `VCACHE_CONFIG` | — | see search order |
 | — | `VCACHE_DISABLE` | — | `false` |
-| — | `VCACHE_LINK_CACHE` | — | `false` |
+| `vcache.link_cache` | `VCACHE_LINK_CACHE` | — | `false` |
+| `vcache.link_verify` | `VCACHE_LINK_VERIFY` | — | `false` |
 | — | `VCACHE_TRACER` | — | next to the binary |
 | — | `VCACHE_RECACHE` | — | `false` |
 | — | `VCACHE_COMPILER_CHECK` | — | `version` |
@@ -274,6 +275,42 @@ against their recorded digest before every hit. S3 may carry the small manifest
 and result metadata, but link-output sidecars are deliberately local in this
 version; remote-only link caching is therefore declined. `VCACHE_READONLY=1`
 serves existing local link hits but writes neither metadata nor sidecars.
+
+### Verifying link hits
+
+Set both `VCACHE_LINK_CACHE=1` and `VCACHE_LINK_VERIFY=1` to check eligible cache
+hits against a fresh link. The equivalent TOML keys are `vcache.link_cache` and
+`vcache.link_verify`; environment variables override them. Both default off.
+`--show-config` reports verification as ignored when link caching is off.
+
+Verification validates the cached output set and sidecar checksums, then runs
+the real linker under the tracer. It compares every declared output, including
+map files, by content digest and recorded executable status. The build receives
+the fresh outputs, diagnostics and exit status. Cached outputs are never placed
+before that link, and a failing fresh link never falls back to the cached binary.
+This costs a full link plus comparison, so it is an observation mode for a soak,
+not a faster way to build.
+
+`--show-stats` reports three additional counters:
+
+- `link verified`: all outputs agree and the fresh trace is usable.
+- `link mismatch`: output bytes or executable status differ. The fresh result
+  can replace the entry only after the ordinary trace and storage checks pass.
+- `link verify error`: the fresh link failed, expected outputs could not be
+  read, or equal outputs lacked a usable trace. Scratch setup failures count too.
+
+Each real link increments `cache miss`; verification never increments a served
+hit. Failed links also increment `compile failed`, and successful replacements
+count under `entries stored`. Missing or checksum-corrupt sidecars are ordinary
+misses with no verification outcome. `VCACHE_RECACHE=1` bypasses comparison;
+`VCACHE_READONLY=1` compares but never repairs the entry. Single-flight waiters
+also perform a fresh link before reporting verification.
+
+Use `VCACHE_LOG` to retain the candidate/pre-key, command, compiler identity,
+roots, per-output cached/fresh digests and executable status, and trace outcome.
+A mismatch can also reveal linker nondeterminism; investigate it before enabling
+ordinary link hits. Verification itself does not enable link caching globally
+or establish that a soak has passed.
 
 ### Why the linker's shared libraries are inputs
 

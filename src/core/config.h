@@ -200,6 +200,7 @@ struct Config {
   // from preprocessed text, and a wrong answer there is a mislinked binary
   // rather than a slow build.
   bool link_cache = false;
+  bool link_verify = false;
 
   // Fail the invocation when a cache layer is broken, as opposed to cold.
   // Off by default: a cache that cannot be reached should slow a build down,
