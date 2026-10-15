@@ -351,6 +351,7 @@ test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACE
 	@$(TOP)/tests/cctype_include_check.sh
 	@$(TOP)/tests/integration_test.sh
 	@bash $(TOP)/tests/link_verify_test.sh
+	@PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/link_verify_worktrees_test.py
 
 # Not part of `test`: it downloads two kernel tarballs, wants ~10 GB of disk and
 # takes minutes. Pass options through with KERNEL_TEST_ARGS, e.g.

@@ -312,6 +312,10 @@ A mismatch can also reveal linker nondeterminism; investigate it before enabling
 ordinary link hits. Verification itself does not enable link caching globally
 or establish that a soak has passed.
 
+For real concurrent builds, use the [worktree verification harness](link-verification.md).
+It requires positive verification coverage and retains candidate and fresh
+outputs, logs, counters and timing evidence.
+
 ### Why the linker's shared libraries are inputs
 
 A link entry records every shared library loaded by the toolchain processes, not
