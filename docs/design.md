@@ -627,6 +627,17 @@ host was busy, so the choice rests on the grouping, not on the 1–4 MiB order.
 
 ## Incoming prefix-map flags
 
+For C/C++, `RootMap::PrefixMapArgs` emits `-ffile-prefix-map` for every root,
+including a self-map whose local and canonical paths are equal. Omitting only
+that self-map could make cached bytes depend on which tree filled the entry.
+In the measured clang build, mapping changed `__FILE__` from
+`model_loader/./detail/lightgbm.h` to `model_loader/detail/lightgbm.h`; a plain
+compile with the same map produced the same string. Compare against a plain
+compile with identical mapping flags, not an unmapped invocation. This is an
+observed compiler path-string rewrite, not a guarantee that every compiler
+normalises such paths or that filesystem probes through symlink-sensitive `..`
+can be simplified.
+
 A caller-supplied `-ffile-prefix-map` and vcache's own would both be on the
 command line, and gcc resolves overlaps last-match-wins — so whichever vcache
 appended would silently win. Since vcache's whole job is deciding what paths end
