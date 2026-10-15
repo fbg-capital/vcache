@@ -117,6 +117,9 @@ pre-commit or pre-push gate: run `make test` yourself before every push.
   (`kCacheKeyVersion`, `kManifestKeyVersion`, `kDepScanKeyVersion`, `vcache-rust-key-vN`,
   the manifest header) and says so in the body; an unbumped key change serves old entries
   for new inputs.
+  Dependency-discovery and validation fixes also need this review: if an old entry
+  can bypass the fix, bump the affected lookup namespace even when its format is
+  unchanged. Verify an old warm entry misses after upgrade, then the new entry hits.
 - A change that alters the shipped binary ends its body with `Deploy: vcache` so the
   reader knows `dist/` must be rebuilt.
 
@@ -160,6 +163,16 @@ the pre-fix code:
 
 Test-only refactors that do not change what is asserted are exempt; say so in the body.
 
+- **Dependency states:** when changing what recording accepts, test the full sequence:
+  record, hit, filesystem change, miss. Include file-to-directory transitions for
+  absence checks, so recording and lookup agree on errors such as `ENOTDIR`.
+- **Tracer completeness:** when changing trace hooks or transport, inject record loss,
+  truncation and environment changes; verify incomplete traces cannot certify a hit.
+  Check hook exports in a build against the oldest supported headers: newer host
+  headers can hide missing hooks in shipped binaries.
+- **Compiler output:** when parsing a new output form, establish its escaping rules
+  with a real compiler fixture, including a path containing a literal backslash.
+
 ## Build / test
 
 Prerequisites: a C++20 compiler, `make`, `curl` and `jq` (the Rust integration tests also
@@ -185,6 +198,11 @@ Any PR must keep both at zero failures.
   decisions. Each section builds its own tree under `$WORK`.
 - `VCACHE_LOG=<file>` logs every decision of a real build; `--show-stats` lists counts per
   reason (`src/core/reason.h`); `--daemon-status` is the daemon's view.
+- **Portability:** for platform-sensitive test/build changes, use
+  `.github/workflows/platform-check.yml` as the target matrix. Specify language
+  standards, detect compiler/tool capabilities, and use the target's ABI values.
+  Time-sensitive fixtures must meet every timestamp condition: backdating mtime
+  does not age ctime. Report tested and untested targets separately.
 
 ### Installed binaries
 
@@ -195,6 +213,10 @@ dc-build from a `git archive` of HEAD inside the images; the old binary is kept 
 `vcache.prev`). The script builds whatever `~/fbg/vcache` has checked out; it does not pull. Stores live under `/build/<user>/cache/vcache/<os>`; `--show-stats` needs
 `VCACHE_DIR` and the same `VCACHE_CACHE_SIZE` the builds use, or a running daemon refuses
 the client.
+
+After rebuilding, check each `vcache.commit` against the merged revision and run
+the affected regressions against the installed binary/tracer pair in its own
+environment. Resolve compiler executable names there before running the tests.
 
 ## Gotchas
 
