@@ -98,6 +98,16 @@ sed_inplace() {
 # True when the C compiler called `gcc` is really clang, as it is on macOS.
 # Some expectations differ between the two and are not about vcache being wrong.
 cc_is_clang() { gcc --version 2>/dev/null | head -1 | grep -qi clang; }
+# GNU timeout is not on stock macOS. perl's alarm survives exec and kills the
+# command with SIGALRM when the bound passes.
+run_bounded() {  # $1 seconds, then the command
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$secs" "$@"
+  fi
+}
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 # Releases a manifest-pause fifo. The write happens only when the compile is
@@ -3807,10 +3817,11 @@ section "a compiler with the absent-deps patch does not share the stock entries"
 # it names the PCH a compile read. The stub patches the stock output the same
 # way, so an entry served across the two would replay the stock depfile. It
 # takes -fabsent-deps= as the patched compiler does, with nothing to list.
-reset_cache
 ad="$WORK/absent-deps"
 mkdir -p "$ad"
 printf 'int f(void) { return 1; }\n' > "$ad/s.c"
+if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
+reset_cache
 cat > "$ad/patched-gcc" <<EOF
 #!/bin/sh
 if [ "\$1" = "-v" ]; then
@@ -3854,6 +3865,9 @@ ad_scan "$ad/patched-gcc" patched.M
 check "the patched compiler's dependency scan misses on the stock one" \
   "$(hits)/$(misses)" "0/2"
 check "and its output names the PCH" "$(grep -c 'pch\.h\.gch' "$ad/patched.M")" "1"
+else
+  skipped "the absent-deps fingerprint stub wraps gcc, which is not installed or is clang"
+fi
 
 # The banner is hashed as printed. A token that starts a line must not take the
 # line break with it: these two banners then read the same.
@@ -3942,6 +3956,14 @@ cat > "$WORK/tracer-openat/stats.c" <<'STATSEOF'
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+/* The __xstat family takes the stat layout version, which glibc 2.33 stopped
+   exporting as _STAT_VER: 1 on x86_64, 0 on the generic layout (aarch64,
+   riscv64). The wrong one fails with EINVAL and probes nothing. */
+#if defined(__x86_64__)
+#define STAT_VER 1
+#else
+#define STAT_VER 0
+#endif
 int main(void) {
   struct stat st;
   struct stat64 st64;
@@ -3949,11 +3971,11 @@ int main(void) {
   int (*xstat)(int, const char *, struct stat *) = dlsym(RTLD_DEFAULT, "__xstat");
   int (*lxstat64)(int, const char *, struct stat64 *) = dlsym(RTLD_DEFAULT, "__lxstat64");
   if (xstat == NULL || lxstat64 == NULL) return 1;
-  if (xstat(1, "absent-xstat", &st) == 0) return 2;
-  if (lxstat64(1, "absent-lxstat64", &st64) == 0) return 3;
+  if (xstat(STAT_VER, "absent-xstat", &st) == 0) return 2;
+  if (lxstat64(STAT_VER, "absent-lxstat64", &st64) == 0) return 3;
   if (stat64("absent-stat64", &st64) == 0) return 4;
   if (statx(AT_FDCWD, "absent-statx", 0, STATX_BASIC_STATS, &stx) == 0) return 5;
-  if (xstat(1, "dir/value", &st) != 0) return 6;
+  if (xstat(STAT_VER, "dir/value", &st) != 0) return 6;
   if (statx(0, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) != 0) return 7;
   return 0;
 }
@@ -3974,6 +3996,52 @@ check "and what it found" \
   "$(grep -cxF $'R\t'"$openat_p/dir/value" "$WORK/tracer-openat/trace")" "1"
 check "a stat of a descriptor, with an empty path, is not a lost record" \
   "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo lost || echo fine)" "fine"
+
+# gnulib and coreutils probe with euidaccess, and eaccess is a separate symbol
+# for the same call. Each absence is recorded.
+cat > "$WORK/tracer-openat/eaccess.c" <<'EACCEOF'
+#define _GNU_SOURCE
+#include <unistd.h>
+int main(void) {
+  if (euidaccess("absent-euidaccess", F_OK) == 0) return 1;
+  if (eaccess("absent-eaccess", F_OK) == 0) return 2;
+  return 0;
+}
+EACCEOF
+gcc "$WORK/tracer-openat/eaccess.c" -o "$WORK/tracer-openat/eaccess"
+rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./eaccess )
+check "euidaccess and eaccess behave as without the tracer" "$?" "0"
+check "and each records the path it found absent" \
+  "$(grep -cxF -e $'M\t'"$openat_p/absent-euidaccess" -e $'M\t'"$openat_p/absent-eaccess" \
+      "$WORK/tracer-openat/trace")" "2"
+
+# A process that unsets VCACHE_TRACE_LOG after the tracer has started still
+# marks a lost record: the log's name is read once, at startup. A path holding
+# a newline cannot be recorded, so it is a lost record.
+cat > "$WORK/tracer-openat/unsetenv.c" <<'UNSETEOF'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(void) {
+  if (unsetenv("VCACHE_TRACE_LOG") != 0) return 1;
+  int fd = open("lost\nrecord", O_RDONLY);
+  if (fd >= 0) close(fd);
+  return 0;
+}
+UNSETEOF
+gcc "$WORK/tracer-openat/unsetenv.c" -o "$WORK/tracer-openat/unsetenv"
+rm -f "$WORK/tracer-openat/trace" "$WORK/tracer-openat/trace.incomplete"
+( cd "$WORK/tracer-openat" && \
+  VCACHE_TRACE_LOG="$WORK/tracer-openat/trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./unsetenv )
+check "a lost record after unsetenv still marks the trace incomplete" \
+  "$([[ -e "$WORK/tracer-openat/trace.incomplete" ]] && echo marked || echo unmarked)" "marked"
+check "the tracer exports openat2 whatever glibc it was built against" \
+  "$(nm -D --defined-only "$TOP/bin/vcache-fstrace.so" | grep -cw openat2)" "1"
 
 # A record goes out in one write: finishing a short write with a second one can
 # land after another process's record and tear both. A regular file cannot be
@@ -4823,7 +4891,7 @@ section "precompiled headers"
 make_pch_tree() {
   mkdir -p "$1"
   printf '#define FOO 1\nstruct S { int x; };\n' > "$1/h.h"
-  printf 'int f() { S s{FOO}; return s.x; }\n' > "$1/main.cc"
+  printf 'int f() { S s = {FOO}; return s.x; }\n' > "$1/main.cc"
 }
 
 if command -v clang++ >/dev/null 2>&1; then
@@ -6011,7 +6079,7 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   mkdir -p "$sf/inc" "$sf/bin"
   printf '#pragma once\n#define BIG 5\n' > "$sf/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$sf/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$sf/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$sf/main.cc"
   ( cd "$sf" && g++ -O2 -I inc -x c++-header -c h.h -o h.h.gch )
   # Counts real compiles and holds each one long enough for the other to wait.
   cat > "$sf/bin/slowg++" <<EOF
@@ -6058,7 +6126,7 @@ if command -v clang++ >/dev/null 2>&1; then
   mkdir -p "$pc/inc"
   printf '#pragma once\n#define BIG 5\n' > "$pc/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$pc/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$pc/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$pc/main.cc"
   mf_build_pch() {
     ( cd "$pc" && clang++ -O2 -I inc -x c++-header -c h.h -Xclang -emit-pch -o h.pch )
   }
@@ -6150,7 +6218,7 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   mkdir -p "$gp/inc"
   printf '#pragma once\n#define BIG 5\n' > "$gp/inc/big.h"
   printf '#pragma once\n#include "big.h"\nstruct S { int x; };\n' > "$gp/h.h"
-  printf 'int f() { S s{BIG}; return s.x; }\n' > "$gp/main.cc"
+  printf 'int f() { S s = {BIG}; return s.x; }\n' > "$gp/main.cc"
   mf_build_gch() { ( cd "$gp" && g++ -O2 -I inc -x c++-header -c h.h -o h.h.gch ); }
   mf_use_gch() {  # $1 log
     ( cd "$gp" && VCACHE_ROOTS="$gp=proj" VCACHE_LOG="$1" \
@@ -6169,6 +6237,20 @@ if command -v g++ >/dev/null 2>&1 && ! g++ --version 2>/dev/null | head -1 | gre
   mf_build_gch
   mf_use_gch "$(mf_log g3)"
   check "gcc: editing the .gch's header and rebuilding it misses" "$(misses)" "2"
+  # gcc names the PCH in its -E output with %s, unescaped: a backslash in the
+  # directory is the path's own. Included by its absolute name, so the pragma
+  # carries the directory.
+  bs="$WORK/pch-back\\slash"
+  mkdir -p "$bs"
+  printf '#pragma once\n#define BS 3\n' > "$bs/h.h"
+  printf 'int f() { return BS; }\n' > "$bs/main.cc"
+  ( cd "$bs" && g++ -O2 -x c++-header -c h.h -o h.h.gch )
+  reset_cache
+  for i in 1 2; do
+    ( cd "$WORK" && "$VCACHE" g++ -O2 -c -include "$bs/h.h" "$bs/main.cc" -o "$bs/main.o" ) \
+      2>/dev/null
+  done
+  check "gcc: a PCH under a directory holding a backslash is cached" "$(hits)/$(misses)" "1/1"
 else
   skipped "g++ is not installed, or is clang"
 fi
@@ -6207,9 +6289,14 @@ for cc in gcc clang; do
     "$(grep -cE '\] preprocess: .* -MD -MF [^ ]*/pp\.d .*-E t\.c$' "$l")" "1"
   check "$cc: the hit records a state from the -E run" \
     "$(grep -c 'cxx manifest: recorded a state from the preprocessor run' "$l")" "1"
-  check "$cc: from its trace, in place of the stale state, which named the same key" \
-    "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
-    "1/1"
+  if [[ "$(uname -s)" == Linux ]]; then
+    check "$cc: from its trace, in place of the stale state, which named the same key" \
+      "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
+      "1/1"
+  else
+    check "$cc: from its depfile (no tracer here), in place of the stale state" \
+      "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+  fi
   check "$cc: --show-stats counts it" "$(pphit_recorded)" "1"
   l=$(mf_log "pphit3-$cc"); mf_pphit "$cc" "$l"
   check "$cc: the next compile skips the preprocessor" \
@@ -6475,6 +6562,32 @@ EOF
     "$(grep -c 'rejected: .*/gen exists now' "$l")" "1"
   check "absent-deps-1: and the object uses that header" "$(same_object "$d")" "same"
 
+  # A probe through a regular file fails with ENOTDIR: an earlier include
+  # directory holds a file `sub` where a later one holds `sub/h.h`. Nothing can
+  # appear there until `sub` becomes a directory, so the probe is absent, and
+  # the state recorded with it must be served.
+  reset_cache
+  d="$ads/notdir"
+  mkdir -p "$d/first" "$d/second/sub"
+  printf 'not a directory\n' > "$d/first/sub"
+  printf '#define V 2\n' > "$d/second/sub/h.h"
+  printf '#include "sub/h.h"\nint v = V;\n' > "$d/main.c"
+  absent_list first/sub/h.h
+  l=$(mf_log ad-notdir1); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: a probe through a regular file is recorded" \
+    "$(grep -c "recorded from the compiler's absent list: .*, 1 absent paths" "$l")" "1"
+  l=$(mf_log ad-notdir2); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  check "absent-deps-1: and the next compile hits through the manifest" "$(manifest_hits)" "1"
+  rm "$d/first/sub"
+  mkdir -p "$d/first/sub"
+  printf '#define V 1\n' > "$d/first/sub/h.h"
+  absent_list
+  l=$(mf_log ad-notdir3); absent_run "$d" "$l" "$ads/gcc-ad1" -I first -I second
+  absent_plain "$d" -I first -I second
+  check "absent-deps-1: the file becoming a directory with the header misses" \
+    "$(grep -c 'rejected: .*first/sub/h\.h exists now' "$l")" "1"
+  check "absent-deps-1: and the object uses that header" "$(same_object "$d")" "same"
+
   # A listed path that exists is the compiler's fault: no state is stored.
   reset_cache
   d="$ads/exists"
@@ -6618,7 +6731,7 @@ if command -v clang >/dev/null 2>&1; then
   cat > "$adc/clang-ad1" <<EOF
 #!/bin/sh
 if [ "\$1" = "-v" ]; then
-  clang -v 2>&1 | sed 's/^\(clang version .*\)\$/\1 absent-deps-1/' >&2
+  clang -v 2>&1 | sed 's/^\(.*clang version .*\)\$/\1 absent-deps-1/' >&2
   exit 0
 fi
 printf '%s|%s\n' "\${LD_PRELOAD:-none}" "\$*" >> "$adc/calls"
@@ -6749,14 +6862,15 @@ if command -v clang >/dev/null 2>&1; then
   mkdir -p "$WORK/ccfg"
   printf 'int f(int *p) { int s = 0; for (int i = 0; i < 100; i++) s += p[i]; return s; }\n#ifdef FOO\nint foo(void) { return 1; }\n#endif\n' \
     > "$WORK/ccfg/s.c"
-  cfgcc() { ( cd "$WORK/ccfg" && env "$@" "$VCACHE" clang --config="$WORK/ccfg/my.cfg" -c s.c -o s.o ) 2>/dev/null; }
+  # Spelled --config FILE: clang before 16 rejects --config=FILE.
+  cfgcc() { ( cd "$WORK/ccfg" && env "$@" "$VCACHE" clang --config "$WORK/ccfg/my.cfg" -c s.c -o s.o ) 2>/dev/null; }
   reset_cache
   echo '-O0' > "$WORK/ccfg/my.cfg"
   cfgcc VCACHE_CXX_MANIFEST=0
   echo '-O2' > "$WORK/ccfg/my.cfg"
   cfgcc VCACHE_CXX_MANIFEST=0
   check "preprocessor mode: editing a --config file from -O0 to -O2 misses" "$(misses)" "2"
-  ( cd "$WORK/ccfg" && clang --config="$WORK/ccfg/my.cfg" -c s.c -o ref.o ) 2>/dev/null
+  ( cd "$WORK/ccfg" && clang --config "$WORK/ccfg/my.cfg" -c s.c -o ref.o ) 2>/dev/null
   check "and the object is the -O2 one" \
     "$(cmp -s "$WORK/ccfg/s.o" "$WORK/ccfg/ref.o" && echo same)" "same"
   reset_cache
@@ -6779,6 +6893,9 @@ mkdir -p "$WORK/memo"
 printf 'int old_header(void);\n' > "$WORK/memo/h.h"
 printf '#include "h.h"\nint m(void) { return 0; }\n' > "$WORK/memo/m.c"
 perl -e 'utime time - 3600, time - 3600, @ARGV' "$WORK/memo/h.h" "$WORK/memo/m.c"
+# A digest is memoised only once the file's ctime, which nothing can backdate,
+# is two seconds old too (file_memo.cc); a fast host compiles before that.
+sleep 3
 ( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
 ( cd "$WORK/memo" && "$VCACHE" gcc -c m.c -o m.o ) 2>/dev/null
 check "settled files' digests are memoised under filehash/" \
@@ -6870,7 +6987,7 @@ fi
 
 section "10b. Single-flight"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
+  run_bounded 120 python3 "$TOP/tests/daemon_lease_test.py" "$VCACHE" "$WORK/single-flight" \
     > "$WORK/single-flight.report" 2> "$WORK/single-flight.errors"
   lease_test_exit=$?
   while IFS='|' read -r outcome message; do
@@ -6888,7 +7005,7 @@ fi
 
 section "10d. Elastic jobserver"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_elastic_test.py" "$VCACHE" "$WORK/elastic" \
+  run_bounded 120 python3 "$TOP/tests/daemon_elastic_test.py" "$VCACHE" "$WORK/elastic" \
     "$TOP/bin/vcache_test" > "$WORK/elastic.report" 2> "$WORK/elastic.errors"
   elastic_test_exit=$?
   while IFS='|' read -r outcome message; do
@@ -6906,7 +7023,7 @@ fi
 
 section "10c. Memory admission"
 if command -v python3 >/dev/null 2>&1; then
-  timeout 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
+  run_bounded 120 python3 "$TOP/tests/daemon_admission_test.py" "$VCACHE" "$WORK/admission" \
     "$TOP/bin/vcache_test" > "$WORK/admission.report" 2> "$WORK/admission.errors"
   admission_test_exit=$?
   while IFS='|' read -r outcome message; do

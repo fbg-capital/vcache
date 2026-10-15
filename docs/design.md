@@ -222,8 +222,8 @@ splits `LD_PRELOAD` there), and when `LD_PRELOAD` is already set. A trace that
 turns out unusable after the compile gives the depfile alone, since the list
 was not asked for: when no process loaded the tracer, when the trace is marked
 incomplete (a `.incomplete` file beside it, or a `!` line in it when that file
-cannot be created), does not parse, holds a relative record (written by a
-tracer from before records were absolute) or names no process, when no
+cannot be created), lacks its final newline, does not parse, holds a relative
+record (written by a tracer from before records were absolute) or names no process, when no
 compiler front end (`cc1*`, `clang`) ran under it, when a missing directory on
 the include path is not among its absent paths, when the compiler's include
 directories cannot be listed, when the trace does not show a file the depfile
@@ -770,8 +770,9 @@ for counters, read-only/recache behavior and the cost of this opt-in mode.
 - **Linking is cached only on request** (`VCACHE_LINK_CACHE=1`, Linux only, traced
   through `vcache-fstrace.so`); ccache and sccache do not cache it.
 - **The tracer sees only calls that reach it through the dynamic linker.** It
-  interposes the open, stat (`stat`, `stat64`, `statx`, the `*at` forms and the
-  pre-2.33 `__xstat` family), `access`, `readlink`, `readlinkat`, `opendir` and
+  interposes the open (including glibc's `openat2`), stat (`stat`, `stat64`, `statx`,
+  the `*at` forms and the pre-2.33 `__xstat` family), `access`, `euidaccess`,
+  `eaccess`, `readlink`, `readlinkat`, `opendir` and
   `fdopendir` entry points. A raw `syscall()`, a static binary, a process that
   drops `LD_PRELOAD`, and glibc's own internal opens (locale, gconv, nss data,
   which never cross the PLT) leave no record. A stat of an open descriptor
@@ -788,7 +789,13 @@ for counters, read-only/recache behavior and the cost of this opt-in mode.
   root; a raw `SYS_chroot` or `pivot_root` is not seen. A thread changing
   directory between another's call and its record misattributes that record. A
   reader refuses a trace holding a relative record, which only a tracer from
-  before this rule writes: the directory it was relative to is unknown.
+  before this rule writes: the directory it was relative to is unknown. It also
+  refuses a nonempty trace without a final newline, which may end in a partial
+  path. The tracer retains its log name from startup so clearing the environment
+  cannot prevent it from marking a later lost record.
+  C/C++ manifest keys use version 8 and link keys version 5 to exclude entries
+  recorded before these tracer fixes. The preprocessor key uses version 7 for
+  the corrected GCC PCH pragma path handling; Rust keys are unchanged.
 - **A probe that fails for a reason other than `ENOENT` records nothing.** The
   tracer records a successful open or probe as an input (`R`) and an `ENOENT`
   failure as an absence (`M`); `EACCES`, `ENOTDIR`, `ELOOP` and every other
@@ -805,7 +812,8 @@ for counters, read-only/recache behavior and the cost of this opt-in mode.
 - **Precompiled headers** are covered by the integration tests for clang
   (`-include-pch`) and for gcc (`-include` with a `.gch` beside the header).
   Clang's `-E` expands the header text. GCC's internal `-E -fpch-preprocess`
-  loads the PCH and names it in a pragma; the key covers its identity or bytes.
+  loads the PCH and names it in a pragma; the path is taken verbatim, including
+  any backslashes, and the key covers its identity or bytes.
   GCC consumers can share across directories when their PCHs carry the same
   fresh `.sum` or `.vcache-key`. The manifest key names explicit PCHs too.
   Caller-supplied `-fpch-preprocess` remains declined.

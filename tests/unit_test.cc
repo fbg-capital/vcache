@@ -362,6 +362,14 @@ void TestLinkTraceClassification() {
   core::TraceRecords lost;
   Check(!core::ReadTraceRecords(log, &lost),
         "a trace carrying the tracer's lost-record line is refused");
+  // A write cut short (ENOSPC, RLIMIT_FSIZE) leaves a prefix of a path with
+  // no newline after it, which would read as a record of another path.
+  util::WriteFileAtomic(log, "P\t/usr/bin/ld\nM\t/usr/inc");
+  core::TraceRecords cut;
+  Check(!core::ReadTraceRecords(log, &cut), "a trace whose last record has no newline is refused");
+  util::WriteFileAtomic(log, "");
+  core::TraceRecords empty;
+  Check(core::ReadTraceRecords(log, &empty), "an empty trace still reads");
   // An older tracer wrote paths as the process spelled them, relative to a
   // directory the process may have left.
   util::WriteFileAtomic(log, "P\t/usr/bin/ld\nR\ta.o\n");
@@ -6033,7 +6041,8 @@ void TestCxxAbsentList() {
     std::string path;
     ~ScratchGuard() { util::RemoveRecursive(path); }
   } guard{*scratch};
-  const std::string proj = *scratch + "/proj";
+  // macOS's TMPDIR ends in a slash; the parser drops the doubled one.
+  const std::string proj = core::WithoutDotSegments(*scratch) + "/proj";
   util::MakeDirs(proj + "/inc");
 
   const core::CxxAbsentList listed =
@@ -6067,6 +6076,9 @@ void TestCxxAbsentList() {
           "a path lstat cannot show absent (ENAMETOOLONG) is reported like one that exists");
   Check(!core::ParseCxxAbsentList("inc/h.h/x.h\n", proj).existing_path.has_value(),
         "a path through a file (ENOTDIR) is absent");
+  // A lookup must agree, or a state recorded with that path is never served.
+  Check(!core::FindAppearedPath({proj + "/inc/h.h/x.h"}, MakeRoots({})).has_value(),
+        "and a lookup takes it as still absent");
 }
 
 void TestCxxManifest() {

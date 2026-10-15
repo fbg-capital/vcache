@@ -39,7 +39,7 @@ namespace {
 
 // Bumped whenever the key derivation or blob layout changes, so old entries are
 // ignored rather than misinterpreted.
-constexpr std::string_view kCacheKeyVersion = "vcache-key-v6";
+constexpr std::string_view kCacheKeyVersion = "vcache-key-v7";
 constexpr std::string_view kPchIdentityVersion = "vcache-pch-identity-v1";
 
 // Runs the compiler unchanged and returns its exit code. The fallback path for
@@ -972,7 +972,7 @@ namespace {
 
 // New kinds of entry, so neither changes an existing key: the manifest itself,
 // and the result key of a compile that could not be preprocessed.
-constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v7";
+constexpr std::string_view kCxxManifestKeyVersion = "vcache-cxx-manifest-v8";
 constexpr std::string_view kCxxDerivedKeyVersion = "vcache-cxx-derived-v1";
 
 // gcc writes a dependency file named by one of these from the preprocessor.
