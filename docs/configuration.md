@@ -316,6 +316,17 @@ For real concurrent builds, use the [worktree verification harness](link-verific
 It requires positive verification coverage and retains candidate and fresh
 outputs, logs, counters and timing evidence.
 
+Downstream builds that call devtools' `exportVcacheEnv` use
+`FBG_VCACHE_LINK=off|on|verify` (default `off`). The helper sets
+`VCACHE_LINK_CACHE`/`VCACHE_LINK_VERIFY` to `0/0`, `1/0`, or `1/1` respectively,
+overwriting raw values on each call so a previous shell mode cannot leak through.
+`FBG_VCACHE=0` disables both. Invalid modes fail with both flags off; verify mode
+also refuses binaries whose successful `--show-config` output cannot confirm
+both settings are on. Host and el10 select their own installed binary and store.
+This configures existing link wrappers; it does not change compiler routing or
+install a linker launcher. See devtools' `docs/host-setup.md`, "Opt-in link
+verification", for compatibility checks, precedence and soak requirements.
+
 ### Why the linker's shared libraries are inputs
 
 A link entry records every shared library loaded by the toolchain processes, not
