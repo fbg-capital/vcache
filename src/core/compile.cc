@@ -1716,16 +1716,6 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
                util::Join(parsed.native_flags, " "));
   }
 
-  auto temp_dir = util::MakeScratchDir(cache_dir, "vcache-");
-  if (!temp_dir) {
-    RecordDecision(cache_dir, Reason::kNoTempDir);
-    return RunPassthrough(argv);
-  }
-  struct TempDirGuard {
-    std::string path;
-    ~TempDirGuard() { util::RemoveRecursive(path); }
-  } guard{*temp_dir};
-
   // Taken before anything reads the sources: a file changed after this may not
   // be the version the compile read, so it is not recorded in a manifest.
   const int64_t started_ns = util::NowUnixNs();
@@ -1834,6 +1824,16 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   }
 
   // ---- preprocess ---------------------------------------------------------
+
+  auto temp_dir = util::MakeScratchDir(cache_dir, "vcache-");
+  if (!temp_dir) {
+    RecordDecision(cache_dir, Reason::kNoTempDir);
+    return RunPassthrough(argv);
+  }
+  struct TempDirGuard {
+    std::string path;
+    ~TempDirGuard() { util::RemoveRecursive(path); }
+  } guard{*temp_dir};
 
   const std::string preprocessed = *temp_dir + "/pp.i";
   // A preprocessor hit records a state from this run, so the next lookup is

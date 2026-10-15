@@ -308,3 +308,79 @@ second run. Those unchanged synchronization checks and both logs are retained;
 the subsequent full gate passed 1,470 unit, 1,320 integration, 93 link-verification
 and 15 harness checks (`full-gate-final.log`). No test code was changed.
 
+
+## Lazy scratch implementation follow-up
+
+The follow-up `vcache-zs1` moves the existing C/C++ scratch allocation and its
+cleanup guard past the early manifest-hit return, immediately before preprocessing.
+A hit now restores its outputs even if both scratch locations reject allocation.
+Cold misses, stale manifests and unusable cached results still allocate before
+preprocessing; a miss with no scratch still passes through to the real compiler.
+
+No cache-key/version change is needed: compiler identity, roots, manifest state
+selection, dependency validation and result materialization are unchanged. The
+recording timestamp remains before source reads; allocating later does not weaken
+changed-during-run rejection. The guard retains the same lifetime on the miss path.
+Manifest ordering/tie-breaking and output bytes are preserved; floating-point and
+application RNG behavior are not involved. The change removes only unused scratch
+work. Its opportunity score was impact 1 × confidence 5 / effort 1 = 5; this is a
+small independent cleanup, not the leading digest-table optimization.
+
+`tests/cxx_scratch_test.py` probes and selectively denies vcache's `mkdtemp` calls
+on Linux. Both warm-hit assertions fail against the `7eca5a7` baseline and pass
+after the change, including byte-identical objects and dependency files. The cold,
+stale, unusable-result and denied-miss controls pass before and after. The full
+host gate passes 1,470 unit, 1,320 integration, 93 link-verification, 15 harness
+checks, plus the seven scratch checks. The new test also passes with the EL10
+release toolchain. Its allocation probe is explicitly skipped off Linux; no macOS
+or arm64 execution is claimed.
+
+The retained sunbird workload was replayed against baseline and changed binaries
+in interleaved before/after, after/before, before/after order. All 522 host and
+520 EL10 commands hit in every aggregate run, with identical SHA-256 values for
+every object and depfile. Both clients used the same private running baseline
+daemon and warm store. Setup builds and tests finished before timing. Per-case
+runs contain twenty repetitions of each binary, with separate strace samples.
+
+Milliseconds per hit; wall reports median / p95 / range, user/sys separate medians:
+
+| Platform/case | Before wall | After wall | Before user / sys | After user / sys | Syscalls before → after |
+|---|---|---|---|---|---|
+| host/small | 5.408 / 6.157 / 4.586–6.161 | 5.359 / 6.695 / 3.932–430.867 | 1.010 / 3.646 | 1.015 / 3.887 | 1309 → 1288 |
+| host/median | 6.886 / 7.458 / 6.328–7.850 | 6.787 / 7.681 / 5.599–7.844 | 1.873 / 4.225 | 1.942 / 4.192 | 2985 → 2964 |
+| host/pch | 8.212 / 175.205 / 6.828–240.460 | 8.335 / 190.431 / 7.146–228.449 | 2.236 / 4.802 | 2.009 / 5.218 | 4735 → 4715 |
+| el10/small | 10.655 / 85.817 / 7.116–100.716 | 10.728 / 70.808 / 9.646–122.631 | 1.039 / 5.271 | 0.916 / 5.531 | 1453 → 1432 |
+| el10/median | 19.864 / 70.490 / 12.121–109.072 | 19.246 / 21.280 / 11.230–39.611 | 0.940 / 9.052 | 1.196 / 8.883 | 3225 → 3204 |
+| el10/pch | 20.405 / 69.272 / 15.739–79.323 | 20.195 / 77.230 / 15.024–100.059 | 1.577 / 10.284 | 2.000 / 9.804 | 3534 → 3513 |
+
+All six changed-binary traces have zero scratch-path accesses, down from fourteen
+path-bearing calls each, including directory creation and owner locking/cleanup.
+Total call counts fall by 20–21; source/header validation remains in place. The
+older 26-call attribution included setup operations that can also occur elsewhere
+in a process, so it is not an exact prediction of the net reduction.
+
+Aggregate seconds, rounds 0 / 1 / 2; daemon CPU is additional to child CPU:
+
+| Platform/version | Wall | Child user | Child sys | Daemon user / sys |
+|---|---|---|---|---|
+| host/before | 0.812 / 1.439 / 0.372 | 0.864 / 1.125 / 1.142 | 2.999 / 5.164 / 6.272 | 0.15 / 0.30; 0.28 / 0.46; 0.29 / 0.57 |
+| host/after | 3.028 / 1.517 / 0.498 | 1.042 / 1.094 / 1.102 | 4.168 / 4.478 / 5.605 | 0.21 / 0.74; 0.24 / 0.46; 0.30 / 0.52 |
+| el10/before | 15.084 / 4.518 / 7.850 | 0.921 / 0.971 / 1.112 | 5.300 / 4.942 / 5.172 | 0.11 / 0.43; 0.12 / 0.19; 0.10 / 0.23 |
+| el10/after | 4.095 / 8.528 / 13.257 | 0.951 / 1.004 / 1.393 | 4.913 / 4.825 / 10.082 | 0.10 / 0.30; 0.11 / 0.22; 0.17 / 0.51 |
+
+The latency results are mixed, with substantial shared-host scheduling variance.
+They do not establish a measurable speedup. The verified gain is removal of unused
+filesystem operations and scratch availability from the hit path. Aggregate and
+per-case daemon samples, load averages, binary hashes, output hashes and raw logs
+are retained; syscall timings were not substituted for CPU measurements.
+
+Evidence: `/build/richard/codex-1000/lazy-scratch-20261015/`.
+`regression-before-portable.log` contains the two intended failures with the final
+Python 3.6-compatible harness, which removes its outputs before each compile.
+`regression-after.log`, `build-el10.log` and `full-gate-portable.log` contain passing checks.
+`compare.py`, `compare_el10.py`, `el10_workload.py` and `run.py` retain the exact
+limited-execution recipe. `host-measurements/` and `el10-measurements/` hold command
+results, counter deltas, golden output hashes, PID-scoped traces and environment
+snapshots; `summary.json` contains all timing ranges and separate daemon CPU.
+Artifact names are exclusive; use fresh result/control directories for a rerun.
+
