@@ -35,6 +35,9 @@ enum class Counter {
   // Of the preprocessor hits, those that recorded a manifest state from the
   // -E run, so the next lookup skips the preprocessor.
   kManifestRecordedOnPreprocessorHit,
+  kLinkVerified,
+  kLinkMismatch,
+  kLinkVerifyError,
   kCount,  // sentinel
 };
 

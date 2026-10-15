@@ -236,6 +236,8 @@ void ApplyTomlFile(const std::string& path, Config* config) {
                                    "' (expected manifest or uncacheable)");
       }
     }
+    if (auto v = TomlBool(*vc, "link_cache")) config->link_cache = *v;
+    if (auto v = TomlBool(*vc, "link_verify")) config->link_verify = *v;
     if (auto v = TomlBool(*vc, "cxx_manifest")) config->cxx_manifest = *v;
     if (auto v = TomlBool(*vc, "cxx_manifest_trace")) config->cxx_manifest_trace = *v;
     if (auto v = TomlBool(*vc, "cxx_manifest_absent_deps")) {
@@ -324,6 +326,7 @@ void ApplyEnvironment(Config* config) {
               config->error_on_cache_media_failure);
   config->recache = EnvBool("VCACHE_RECACHE", config->recache);
   config->link_cache = EnvBool("VCACHE_LINK_CACHE", config->link_cache);
+  config->link_verify = EnvBool("VCACHE_LINK_VERIFY", config->link_verify);
 
   if (auto v = Env("VCACHE_INCOMING_PREFIX_MAPS")) {
     if (!ParseIncomingMapPolicy(*v, &config->incoming_map_policy)) {
@@ -564,6 +567,10 @@ std::string DescribeConfig(const Config& config) {
       out << "uncapped\n";
     }
   }
+  out << "link cache:       " << (config.link_cache ? "on" : "off") << "\n";
+  out << "link verify:      "
+      << (!config.link_verify ? "off" : config.link_cache ? "on" : "ignored (link cache off)")
+      << "\n";
   out << "daemon:           " << DaemonModeName(config.daemon.mode) << "\n";
   if (config.daemon.mode != DaemonMode::kOff) {
     out << "  single flight:  " << (config.daemon.single_flight ? "on" : "off") << "\n";

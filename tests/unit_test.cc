@@ -47,6 +47,7 @@
 
 #include "args/compiler_args.h"
 #include "core/link_trace.h"
+#include "core/link.h"
 #include "args/link_args.h"
 #include "args/rustc_args.h"
 #include "core/compile.h"
@@ -5224,6 +5225,88 @@ void TestPchArgs() {
           "the reason is logged and counted as pch timestamps");
 }
 
+void TestLinkVerifyOutputs() {
+#ifdef __linux__
+  Section("link verification output sets and comparison");
+  TempCacheDir cache;
+  const std::string binary = cache.path() + "/app";
+  const std::string map = cache.path() + "/app.map";
+  util::WriteFileAtomic(binary, "binary bytes");
+  util::WriteFileAtomic(map, "map bytes");
+  storage::Blob blob;
+  blob.files = {{binary, *hash::HashFile(binary), false},
+                {map, *hash::HashFile(map), false}};
+  Check(core::LinkOutputSetMatches(blob, {map, binary}),
+        "link output sets match independently of ordering");
+  Check(!core::LinkOutputSetMatches(blob, {binary}),
+        "a cached extra output cannot be ignored during verification");
+  Check(!core::LinkOutputSetMatches(blob, {binary, map, map}),
+        "duplicate requested link outputs cannot pass set validation");
+  Check(!core::LinkOutputSetMatches(blob, {binary, cache.path() + "/other.map"}),
+        "a differently named link output cannot pass set validation");
+  Check(core::LinkOutputsMatch(blob.files) == std::optional<bool>(true),
+        "matching link bytes and executable metadata verify");
+  util::WriteFileAtomic(map, "changed map bytes");
+  Check(core::LinkOutputsMatch(blob.files) == std::optional<bool>(false),
+        "a map-only byte difference makes link verification mismatch");
+  util::WriteFileAtomic(map, "map bytes");
+  ::chmod(binary.c_str(), 0700);
+  Check(core::LinkOutputsMatch(blob.files) == std::optional<bool>(false),
+        "executable metadata alone makes link verification mismatch");
+  util::RemoveFile(map);
+  Check(!core::LinkOutputsMatch(blob.files).has_value(),
+        "an unreadable expected output makes verification indeterminate");
+#endif
+}
+
+void TestLinkVerifyConfigStats() {
+  Section("link verification configuration and stats");
+  TempCacheDir cache;
+  std::map<std::string, std::optional<std::string>> saved;
+  for (const std::string name : {"VCACHE_CONFIG", "VCACHE_LINK_CACHE", "VCACHE_LINK_VERIFY"}) {
+    const char* value = std::getenv(name.c_str());
+    saved[name] = value ? std::optional<std::string>(value) : std::nullopt;
+    ::unsetenv(name.c_str());
+  }
+  const std::string path = cache.path() + "/config.toml";
+  util::WriteFileAtomic(path, "[vcache]\n");
+  ::setenv("VCACHE_CONFIG", path.c_str(), 1);
+  const auto describes = [](const std::string& cache_mode, const std::string& verify_mode) {
+    const std::string shown = core::DescribeConfig(core::LoadConfig());
+    return shown.find("link cache:       " + cache_mode + "\n") != std::string::npos &&
+           shown.find("link verify:      " + verify_mode + "\n") != std::string::npos;
+  };
+  Check(describes("off", "off"), "link caching and verification default off");
+  util::WriteFileAtomic(path, "[vcache]\nlink_cache = true\nlink_verify = true\n");
+  Check(describes("on", "on"), "link cache and verification load from TOML");
+  ::setenv("VCACHE_LINK_CACHE", "0", 1);
+  ::setenv("VCACHE_LINK_VERIFY", "0", 1);
+  Check(describes("off", "off"), "link environment switches override enabled TOML");
+  ::setenv("VCACHE_LINK_VERIFY", "1", 1);
+  Check(describes("off", "ignored (link cache off)"),
+        "show-config explains verification is inactive without link caching");
+  util::WriteFileAtomic(path, "[vcache]\nlink_cache = false\nlink_verify = false\n");
+  ::setenv("VCACHE_LINK_CACHE", "1", 1);
+  Check(describes("on", "on"), "link environment switches override disabled TOML");
+  for (const auto& [name, value] : saved) {
+    if (value) ::setenv(name.c_str(), value->c_str(), 1);
+    else ::unsetenv(name.c_str());
+  }
+
+  const std::string old_counters = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n";
+  CheckEq(core::RenderStats(core::ParseStats(old_counters)), old_counters + "0\n0\n0\n",
+          "old stats acquire three zero link verification counters without shifting fields");
+  const std::string new_counters = old_counters + "12\n13\n14\n";
+  const core::Stats parsed = core::ParseStats(new_counters + "reason\tfuture reason\t15\n");
+  CheckEq(core::RenderStats(parsed), new_counters + "reason\tfuture reason\t15\n",
+          "link verification counts and unknown reasons survive a stats round trip");
+  const std::string shown = core::FormatStats(parsed, "/c", 0, 1);
+  Check(shown.find("link verified       12\n") != std::string::npos &&
+            shown.find("link mismatch       13\n") != std::string::npos &&
+            shown.find("link verify error   14\n") != std::string::npos,
+        "show-stats distinguishes link equality, mismatch and verification error");
+}
+
 void TestStats() {
   Section("core::Stats reasons");
   using core::Counter;
@@ -5235,8 +5318,8 @@ void TestStats() {
             old_stats.Get(Counter::kCacheMediaError) == 9,
         "a nine-line file from an older version parses positionally");
   Check(old_stats.reasons.empty(), "and has no reasons");
-  CheckEq(core::RenderStats(old_stats), old_format + "0\n0\n",
-          "and renders back with zero manifest counters after them");
+  CheckEq(core::RenderStats(old_stats), old_format + "0\n0\n0\n0\n0\n",
+          "and renders back with zero manifest and link verification counters after them");
 
   core::Stats stats;
   stats.Add(Counter::kMiss, 5);
@@ -5253,19 +5336,19 @@ void TestStats() {
         "a passthrough reason is counted on its own");
   const std::string rendered = core::RenderStats(stats);
   CheckEq(rendered,
-          "0\n0\n5\n3\n0\n0\n0\n1\n0\n0\n0\n"
+          "0\n0\n5\n3\n0\n0\n0\n1\n0\n0\n0\n0\n0\n0\n"
           "reason\tlink\t1\n"
           "reason\tno rust dep-info\t1\n"
           "reason\tno temp dir\t1\n"
           "reason\tpreprocess only\t2\n",
-          "reason lines follow the eleven positional counters");
+          "reason lines follow the fourteen positional counters");
   const core::Stats reparsed = core::ParseStats(rendered);
   Check(reparsed.reasons == stats.reasons &&
             std::equal(std::begin(reparsed.values), std::end(reparsed.values),
                        std::begin(stats.values)),
         "ParseStats reads back what RenderStats wrote");
 
-  const core::Stats extended = core::ParseStats(old_format + "0\n0\n" +
+  const core::Stats extended = core::ParseStats(old_format + "0\n0\n0\n0\n0\n" +
                                                 "reason\tlink\t4\n"
                                                 "histogram 1 2 3\n"
                                                 "\n"
@@ -5276,7 +5359,7 @@ void TestStats() {
   Check(extended.GetReason(Reason::kNotCompileOnly) == 4 && extended.reasons.size() == 2,
         "unknown trailing lines are ignored");
   CheckEq(core::RenderStats(extended),
-          old_format + "0\n0\nreason\tfrom a newer version\t6\nreason\tlink\t4\n",
+          old_format + "0\n0\n0\n0\n0\nreason\tfrom a newer version\t6\nreason\tlink\t4\n",
           "a reason this version does not know is carried through");
 
   const core::Stats damaged = core::ParseStats(old_format +
@@ -7143,6 +7226,8 @@ int main(int argc, char** argv) {
   // Also after TestWrittenFileMode, and for the same reason: it writes
   // files, which primes util::DefaultFileMode()'s cached umask.
   TestLinkTraceClassification();
+  TestLinkVerifyOutputs();
+  TestLinkVerifyConfigStats();
   TestStats();
   // Writes files too.
   TestRustManifest();

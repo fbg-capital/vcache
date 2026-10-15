@@ -26,14 +26,23 @@
 // 2270 ms link.
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "core/config.h"
 #include "core/roots.h"
 #include "storage/chain.h"
+#include "storage/storage.h"
 
 namespace vcache::core {
+
+#ifdef __linux__
+bool LinkOutputSetMatches(const storage::Blob& blob,
+                          const std::vector<std::string>& outputs);
+// Unreadable expected outputs are an error, not evidence of unequal link bytes.
+std::optional<bool> LinkOutputsMatch(const std::vector<storage::BlobFile>& expected);
+#endif
 
 // Handles `argv` as a link. Returns the exit code to propagate.
 //

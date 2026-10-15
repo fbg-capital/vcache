@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include "args/link_args.h"
 #include "core/compile.h"
@@ -223,9 +224,10 @@ bool PlaceVerifiedClone(const std::string& stored, const std::string& digest,
   return true;
 }
 
-bool MaterializeOutputs(const storage::Blob& blob,
-                        const std::vector<std::string>& outputs,
-                        storage::DiskStorage* disk) {
+}  // namespace
+
+bool LinkOutputSetMatches(const storage::Blob& blob,
+                          const std::vector<std::string>& outputs) {
   std::vector<std::string> expected = outputs;
   std::vector<std::string> stored_names;
   stored_names.reserve(blob.files.size());
@@ -236,6 +238,22 @@ bool MaterializeOutputs(const storage::Blob& blob,
     VCACHE_LOG("link hit: cached output set does not match this invocation");
     return false;
   }
+  return true;
+}
+
+namespace {
+
+bool LinkOutputDigestValid(const std::string& digest) {
+  return digest.size() == hash::kDigestHexLen &&
+         std::all_of(digest.begin(), digest.end(), [](unsigned char value) {
+           return std::isxdigit(value) != 0;
+         });
+}
+
+bool MaterializeOutputs(const storage::Blob& blob,
+                        const std::vector<std::string>& outputs,
+                        storage::DiskStorage* disk) {
+  if (!LinkOutputSetMatches(blob, outputs)) return false;
 
   for (const storage::BlobFile& f : blob.files) {
     const auto it = std::find(outputs.begin(), outputs.end(), f.name);
@@ -249,12 +267,7 @@ bool MaterializeOutputs(const storage::Blob& blob,
     // that way against 51 s to link outright, and peaked at more memory than
     // the linker used. Cloning the stored file is a reflink where the
     // filesystem allows one.
-    const bool valid_digest =
-        f.contents.size() == hash::kDigestHexLen &&
-        std::all_of(f.contents.begin(), f.contents.end(), [](unsigned char c) {
-          return std::isxdigit(c) != 0;
-        });
-    if (!valid_digest) {
+    if (!LinkOutputDigestValid(f.contents)) {
       VCACHE_LOG("link hit: cached output has an invalid content digest");
       return false;
     }
@@ -272,7 +285,49 @@ bool MaterializeOutputs(const storage::Blob& blob,
   return true;
 }
 
+bool LinkVerifyCandidateValid(const storage::Blob& blob,
+                              const std::vector<std::string>& outputs,
+                              storage::DiskStorage* disk) {
+  if (!LinkOutputSetMatches(blob, outputs)) return false;
+  for (const storage::BlobFile& file : blob.files) {
+    if (!LinkOutputDigestValid(file.contents)) return false;
+    const auto stored = disk->GetFile(file.contents, kLinkOutputSuffix);
+    const auto digest = stored ? hash::HashFile(*stored) : std::nullopt;
+    if (!digest || *digest != file.contents) {
+      VCACHE_LOG("link verify: unusable cached output " + file.name + "; expected=" +
+                 file.contents);
+      return false;
+    }
+  }
+  return true;
+}
+
+struct LinkVerifyCandidate {
+  std::string result_key;
+  // Validated digests and metadata survive eviction without holding large
+  // sidecars in memory or placing cached bytes in the caller's output paths.
+  std::vector<storage::BlobFile> files;
+};
+
 }  // namespace
+
+std::optional<bool> LinkOutputsMatch(const std::vector<storage::BlobFile>& expected) {
+  bool matches = true;
+  bool readable = true;
+  for (const storage::BlobFile& file : expected) {
+    const auto digest = hash::HashFile(file.name);
+    struct stat metadata;
+    const bool have_metadata = ::stat(file.name.c_str(), &metadata) == 0;
+    const bool executable = have_metadata && (metadata.st_mode & S_IXUSR) != 0;
+    readable &= digest.has_value() && have_metadata;
+    matches &= digest && *digest == file.contents && executable == file.executable;
+    VCACHE_LOG("link verify: output=" + file.name + " cached=" + file.contents +
+               " fresh=" + (digest ? *digest : "<unreadable>") +
+               " cached_executable=" + (file.executable ? "1" : "0") +
+               " fresh_executable=" + (!have_metadata ? "?" : executable ? "1" : "0"));
+  }
+  return readable ? std::optional<bool>(matches) : std::nullopt;
+}
 
 int RunLink(const std::vector<std::string>& argv, const Config& config,
             const RootMap& roots, storage::CacheChain* cache, bool* handled) {
@@ -336,6 +391,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   };
   load_entries();
 
+  std::optional<LinkVerifyCandidate> verify_candidate;
   const auto try_link_hit = [&]() {
     if (cache == nullptr) return false;
     for (const LinkManifestEntry& e : entries) {
@@ -346,6 +402,14 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
       if (!result.hit || !storage::DeserializeBlob(result.value, &blob)) {
         VCACHE_LOG("link: manifest entry matched but its result is gone");
         continue;
+      }
+      if (config.link_verify) {
+        if (!LinkVerifyCandidateValid(blob, outputs, &disk)) break;
+        verify_candidate = LinkVerifyCandidate{e.result_key, std::move(blob.files)};
+        VCACHE_LOG("link verify: candidate=" + e.result_key + " pre_key=" + pre_key +
+                   " compiler=" + driver_id.fingerprint + " command=" + util::Join(argv, " ") +
+                   " roots=" + roots.DebugString());
+        return false;
       }
       if (!MaterializeOutputs(blob, outputs, &disk)) break;
       if (!blob.stderr_text.empty()) {
@@ -367,6 +431,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     const auto outcome = session->AcquireLease(pre_key,
         daemon::LeaseWaitBoundMs(cache_dir, cost_key));
     if (outcome != daemon::LeaseOutcome::kCompile) {
+      verify_candidate.reset();
       entries.clear();
       load_entries();
       if (try_link_hit()) {
@@ -381,6 +446,11 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
 
   auto temp_dir = util::MakeScratchDir(cache_dir, "vcache-link-");
   if (!temp_dir) {
+    if (verify_candidate) {
+      RecordCounter(cache_dir, Counter::kLinkVerifyError);
+      VCACHE_LOG("link verify: error candidate=" + verify_candidate->result_key +
+                 " trace=unavailable (no scratch directory)");
+    }
     RecordDecision(cache_dir, Reason::kNoTempDir);
     return RunPassthrough(argv);
   }
@@ -416,7 +486,13 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     ::fputs(result.stderr_data.c_str(), stderr);
   }
   if (result.exit_code != 0) {
-    RecordCounter(cache_dir, Counter::kCompileFailed);
+    if (verify_candidate) {
+      RecordCounters(cache_dir, Counter::kCompileFailed, Counter::kLinkVerifyError);
+      VCACHE_LOG("link verify: error candidate=" + verify_candidate->result_key +
+                 " exit=" + std::to_string(result.exit_code) + " trace=not validated");
+    } else {
+      RecordCounter(cache_dir, Counter::kCompileFailed);
+    }
     return result.exit_code < 0 ? 127 : result.exit_code;
   }
 
@@ -425,13 +501,33 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   // input set is missing an entry, and an entry with a missing input is one
   // that can hit when it should not. Storing it would be worse than not
   // caching this link at all.
-  if (TraceMarkedIncomplete(trace_log)) {
+  const bool trace_incomplete = TraceMarkedIncomplete(trace_log);
+  LinkTrace trace;
+  const bool trace_parsed = !trace_incomplete &&
+      ParseTraceLog(trace_log, outputs, util::CurrentDir(), &trace);
+  const bool trace_usable = trace_parsed && !trace.tools.empty();
+  if (verify_candidate) {
+    const std::optional<bool> matches = LinkOutputsMatch(verify_candidate->files);
+    const Counter counter = !matches || (*matches && !trace_usable)
+                                ? Counter::kLinkVerifyError
+                                : *matches ? Counter::kLinkVerified : Counter::kLinkMismatch;
+    RecordCounter(cache_dir, counter);
+    const std::string outcome = counter == Counter::kLinkVerified ? "verified"
+                             : counter == Counter::kLinkMismatch ? "mismatch" : "error";
+    VCACHE_LOG("link verify: " + outcome + " candidate=" + verify_candidate->result_key +
+               " trace=" + (trace_incomplete ? "incomplete"
+                            : !trace_parsed ? "unusable"
+                            : trace.tools.empty() ? "no processes" : "complete"));
+    if (!matches) {
+      return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit : 0;
+    }
+  }
+  if (trace_incomplete) {
     RecordDecision(cache_dir, Reason::kIncompleteTrace);
     return 0;
   }
 
-  LinkTrace trace;
-  if (!ParseTraceLog(trace_log, outputs, util::CurrentDir(), &trace)) {
+  if (!trace_parsed) {
     VCACHE_LOG("link: no usable trace; not storing");
     return 0;
   }

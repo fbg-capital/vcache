@@ -350,6 +350,7 @@ test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACE
 	@CXX="$(CXX)" CURL_CFLAGS="$(CURL_CFLAGS)" $(TOP)/tests/curl_abi_check.sh
 	@$(TOP)/tests/cctype_include_check.sh
 	@$(TOP)/tests/integration_test.sh
+	@bash $(TOP)/tests/link_verify_test.sh
 
 # Not part of `test`: it downloads two kernel tarballs, wants ~10 GB of disk and
 # takes minutes. Pass options through with KERNEL_TEST_ARGS, e.g.

@@ -755,6 +755,18 @@ it is hot: tens of megabytes per compilation, of which only lines starting with
 
 ## Known limitations
 
+Link-cache verification (`VCACHE_LINK_VERIFY=1`, with link caching enabled)
+checks a candidate against a real traced link before trusting it in a soak.
+It validates the stored sidecars and retains their digests and executable
+metadata, so later cache eviction cannot change the expected result. It never
+materialises the candidate into the caller's paths: fresh outputs, diagnostics
+and exit status are authoritative. Every declared output is compared, and only
+the normal complete-trace storage path may publish a replacement. A failed link
+or unreadable output is a verification error; an incomplete trace cannot certify
+equality or authorize repair. This changes neither the link key nor the manifest
+format. See [verification configuration](configuration.md#verifying-link-hits)
+for counters, read-only/recache behavior and the cost of this opt-in mode.
+
 - **Linking is cached only on request** (`VCACHE_LINK_CACHE=1`, Linux only, traced
   through `vcache-fstrace.so`); ccache and sccache do not cache it.
 - **The tracer sees only calls that reach it through the dynamic linker.** It
