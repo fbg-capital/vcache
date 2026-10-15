@@ -1771,17 +1771,79 @@ bool PollUntil(const std::function<bool()>& condition, int timeout_ms) {
   return false;
 }
 
+struct SessionDaemonReadiness {
+  bool ready;
+  std::string detail;
+  int64_t elapsed_ms;
+};
+
+SessionDaemonReadiness WaitForSessionDaemonReady(int fd) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto deadline = started + std::chrono::seconds(2);
+  const auto finish = [&](bool ready, const std::string& detail) {
+    return SessionDaemonReadiness{ready, detail,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count()};
+  };
+  std::string reply;
+  for (;;) {
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) {
+      return finish(false, "timeout waiting for readiness; partial reply=" + reply);
+    }
+    pollfd ready{fd, POLLIN, 0};
+    const int timeout_ms = static_cast<int>(
+        std::chrono::ceil<std::chrono::milliseconds>(remaining).count());
+    const int polled = ::poll(&ready, 1, timeout_ms);
+    if (polled < 0) {
+      if (errno == EINTR) continue;
+      return finish(false, "poll failed: " + std::string(std::strerror(errno)));
+    }
+    if (polled == 0) continue;
+    char buffer[4096];
+    const ssize_t received = ::read(fd, buffer, sizeof(buffer) - reply.size());
+    if (received < 0) {
+      if (errno == EINTR || errno == EAGAIN) continue;
+      return finish(false, "read failed: " + std::string(std::strerror(errno)));
+    }
+    if (received == 0) {
+      return finish(false, reply.empty() ? "EOF before readiness"
+                                        : "server error: " + reply.substr(1));
+    }
+    reply.append(buffer, static_cast<size_t>(received));
+    if (reply[0] == 'R') return finish(true, "ready");
+    if (reply[0] == 'L') return finish(false, "daemon lock already held");
+    if (reply[0] != 'E') {
+      return finish(false, "unexpected readiness code=" +
+          std::to_string(static_cast<unsigned char>(reply[0])));
+    }
+    if (reply.size() == sizeof(buffer)) {
+      return finish(false, "server error: " + reply.substr(1) + " [truncated]");
+    }
+  }
+}
+
+std::string SessionDaemonExitStatus(int status) {
+  if (WIFEXITED(status)) return "exit=" + std::to_string(WEXITSTATUS(status));
+  if (WIFSIGNALED(status)) return "signal=" + std::to_string(WTERMSIG(status));
+  return "wait status=" + std::to_string(status);
+}
+
 struct SessionDaemon {
   core::Config config;
   std::string directory;
   pid_t pid = -1;
+  bool startup_failed = false;
 
   explicit SessionDaemon(int idle_seconds = 0, bool single_flight = false,
                          bool block_put = false, uint64_t mem_available_kb = 0,
                          const std::map<std::string, std::string>& test_settings = {},
                          bool jobserver = false) {
     directory = util::MakeTempDir("vcache-session-test-").value_or("");
-    if (directory.empty()) return;
+    if (directory.empty()) {
+      FailStartup("temporary directory: " + std::string(std::strerror(errno)));
+      return;
+    }
     config.disk.dir = directory + "/cache";
     config.daemon.idle_timeout_seconds = idle_seconds;
     config.daemon.single_flight = single_flight;
@@ -1790,19 +1852,42 @@ struct SessionDaemon {
     if (mem_available_kb > 0) {
       const std::string meminfo = "MemAvailable: " + std::to_string(mem_available_kb) + " kB\n";
       const int mem_fd = ::open((directory + "/meminfo").c_str(), O_WRONLY | O_CREAT, 0600);
-      if (mem_fd < 0) return;
-      ::write(mem_fd, meminfo.data(), meminfo.size());
+      if (mem_fd < 0) {
+        FailStartup("meminfo open: " + std::string(std::strerror(errno)));
+        return;
+      }
+      const ssize_t written = ::write(mem_fd, meminfo.data(), meminfo.size());
+      const int write_error = errno;
       ::close(mem_fd);
+      if (written != static_cast<ssize_t>(meminfo.size())) {
+        FailStartup(written < 0 ? "meminfo write: " + std::string(std::strerror(write_error))
+                               : "meminfo write: short write");
+        return;
+      }
     }
-    if (block_put && ::mkfifo((directory + "/put-gate").c_str(), 0600) != 0) return;
+    if (block_put && ::mkfifo((directory + "/put-gate").c_str(), 0600) != 0) {
+      FailStartup("put gate: " + std::string(std::strerror(errno)));
+      return;
+    }
     for (const auto& [variable, value] : test_settings) {
       if (variable.ends_with("_GATE") && ::mkfifo((directory + "/" + value).c_str(), 0600) != 0) {
+        FailStartup(variable + ": " + std::string(std::strerror(errno)));
         return;
       }
     }
     int ready_pipe[2];
-    if (::pipe(ready_pipe) != 0) return;
+    if (::pipe(ready_pipe) != 0) {
+      FailStartup("pipe: " + std::string(std::strerror(errno)));
+      return;
+    }
     pid = ::fork();
+    if (pid < 0) {
+      const int fork_error = errno;
+      ::close(ready_pipe[0]);
+      ::close(ready_pipe[1]);
+      FailStartup("fork: " + std::string(std::strerror(fork_error)));
+      return;
+    }
     if (pid == 0) {
       ::close(ready_pipe[0]);
       for (const auto& [variable, value] : test_settings) {
@@ -1822,19 +1907,59 @@ struct SessionDaemon {
       ::_exit(daemon::RunServer(config, ready_pipe[1]));
     }
     ::close(ready_pipe[1]);
-    pollfd ready{ready_pipe[0], POLLIN, 0};
-    char code = 0;
-    Check(::poll(&ready, 1, 2000) > 0 && ::read(ready_pipe[0], &code, 1) == 1 &&
-              code == 'R', "session daemon becomes ready within two seconds");
+    const auto readiness = WaitForSessionDaemonReady(ready_pipe[0]);
     ::close(ready_pipe[0]);
+    if (!readiness.ready) FailStartup(readiness.detail, readiness.elapsed_ms);
+    else Check(true, "session daemon becomes ready within two seconds");
+  }
+
+  void FailStartup(const std::string& detail, int64_t elapsed_ms = 0) {
+    startup_failed = true;
+    std::string child = pid > 0 ? "pid=" + std::to_string(pid) + " running" : "not spawned";
+    if (pid > 0) {
+      int status = 0;
+      pid_t reaped;
+      do { reaped = ::waitpid(pid, &status, WNOHANG); } while (reaped < 0 && errno == EINTR);
+      if (reaped == pid) {
+        child = "pid=" + std::to_string(pid) + " " + SessionDaemonExitStatus(status);
+        pid = -1;
+      } else if (reaped < 0) {
+        const int wait_error = errno;
+        child = "pid=" + std::to_string(pid) + " waitpid: " + std::strerror(wait_error);
+        if (wait_error == ECHILD) pid = -1;
+      }
+    }
+    ReportStartupFailure("session daemon startup failed: " + detail +
+        "; elapsed_ms=" + std::to_string(elapsed_ms) + "; child=" + child +
+        "; section=" + g_section + "; retained=" + directory + "\n");
+    Check(false, "session daemon becomes ready within two seconds");
+  }
+
+  void ReportStartupFailure(const std::string& diagnostic) const {
+    std::fputs(diagnostic.c_str(), stderr);
+    if (!directory.empty()) {
+      FILE* file = std::fopen((directory + "/startup.txt").c_str(), "a");
+      if (file) {
+        std::fputs(diagnostic.c_str(), file);
+        std::fclose(file);
+      }
+    }
   }
 
   ~SessionDaemon() {
     if (pid > 0) {
       ::kill(pid, SIGKILL);
-      ::waitpid(pid, nullptr, 0);
+      int status = 0;
+      pid_t reaped;
+      do { reaped = ::waitpid(pid, &status, 0); } while (reaped < 0 && errno == EINTR);
+      if (startup_failed) {
+        const std::string outcome = reaped == pid ? SessionDaemonExitStatus(status)
+                                                : std::strerror(errno);
+        ReportStartupFailure("session daemon cleanup: pid=" + std::to_string(pid) +
+                             " " + outcome + "\n");
+      }
     }
-    if (!directory.empty()) util::RemoveRecursive(directory);
+    if (!directory.empty() && !startup_failed) util::RemoveRecursive(directory);
   }
 
   std::string Status() const {
@@ -7157,6 +7282,10 @@ void TestMemoryEstimates() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "--session-daemon-startup-probe") {
+    SessionDaemon server;
+    return g_fail == 0 ? 0 : 1;
+  }
   if (argc >= 7 && (std::string(argv[1]) == "--write-lease-cost-fixture" ||
                     std::string(argv[1]) == "--write-admission-cost-fixture")) {
     const bool admission = std::string(argv[1]) == "--write-admission-cost-fixture";
