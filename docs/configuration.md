@@ -1002,11 +1002,27 @@ compiler's executables, the shared objects they load and its own trees
 left out: the compiler fingerprint stands for them. On `src/daemon/server.cc` a
 state holds 1091 absent paths under g++ and 902 under clang++, and a hit takes
 5.9 ms and 6.1 ms (min of 30; median 7.4 and 7.5), against 5.8 ms and 5.5 ms
-(median 6.7 and 6.7) before the trace. The result is stored under the ordinary
-preprocessor key, so a tree with `cxx_manifest` off hits entries a tree with it
-on stored, and the reverse. A hit logs
+(median 6.7 and 6.7) before the trace. Results from the preprocessor path are
+shared with `cxx_manifest` off. A hit logs
 `cxx manifest hit on disk: <key> state 1 of 1; preprocessor skipped`, and
 `--show-stats` counts it as a hit and again under `manifest hits`.
+
+With no stored states (including an empty or undecodable manifest), a writable
+compile with a usable tracer skips `-E` and derives its result key from
+the recorded inputs. It must support a full `-MD` dependency file and keep its
+working directory. Read-only, recache, untraced and absent-list-only runs keep
+preprocessing, as do PCH producers and consumers whose command identifies a PCH.
+A failed or incomplete trace,
+uncovered depfile input, volatile macro, `.incbin`, or input changed during the
+compile prevents storing a cold-derived result; the fresh compiler output and
+status still reach the caller. Cache media errors retain their normal reporting.
+
+Stale states and matching states with missing or unusable results still run
+`-E`. The first comment-only header edit after a cold-derived fill can compile
+again because no preprocessor-key entry exists yet. Once that entry is seeded,
+another benign edit can hit it and record a new manifest state. The next
+unchanged lookup hits the manifest. A derived entry and a preprocessor entry
+for the same object may coexist; only the latter is shared with manifest-off mode.
 
 A lookup the manifest does not answer but the preprocessor key does (a header
 edited only in a comment, a clang PCH rebuilt with other bytes and no side
@@ -1023,7 +1039,7 @@ saw is dropped; the compile records the state.
 | Setting | Meaning |
 | --- | --- |
 | `true` | Look up and record manifest states. |
-| `false` *(default)* | Preprocess on every lookup. Entries are shared with `true`. |
+| `false` *(default)* | Preprocess on every lookup. Preprocessor-key entries are shared with `true`. |
 
 ```toml
 [vcache]

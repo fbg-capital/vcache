@@ -5185,9 +5185,9 @@ printf '#pragma once\nenum { kBase = 3 };\n' > "$WORK/mf-y/inc/base.h"
 mf_abs "$WORK/mf-y" "$(mf_log y2)"
 check "a header edited in that worktree misses there" "$(misses)" "2"
 
-# Both modes store under the preprocessor key, so each finds the other's entry.
+# Untraced misses store a preprocessor key shared by both lookup modes.
 reset_cache
-mf_compile "$WORK/mf-x" "$(mf_log m1)"
+VCACHE_CXX_MANIFEST_TRACE=0 mf_compile "$WORK/mf-x" "$(mf_log m1)"
 l=$(mf_log m2)
 ( cd "$WORK/mf-x" && VCACHE_CXX_MANIFEST=0 VCACHE_ROOTS="$WORK/mf-x=proj" VCACHE_LOG="$l" \
     "$VCACHE" gcc -O2 -I inc -c src/top.c -o top.o ) 2>/dev/null
@@ -5196,7 +5196,7 @@ check "and never looks at a manifest" "$(grep -c 'cxx manifest' "$l" || true)" "
 reset_cache
 ( cd "$WORK/mf-x" && VCACHE_CXX_MANIFEST=0 VCACHE_ROOTS="$WORK/mf-x=proj" \
     "$VCACHE" gcc -O2 -I inc -c src/top.c -o top.o ) 2>/dev/null
-l=$(mf_log m4); mf_compile "$WORK/mf-x" "$l"
+l=$(mf_log m4); VCACHE_CXX_MANIFEST_TRACE=0 mf_compile "$WORK/mf-x" "$l"
 check "manifest mode hits an entry preprocessor mode stored" "$(hits)" "1"
 check "through the preprocessor, with no manifest stored yet" \
   "$(grep -c 'cxx manifest: none stored' "$l")" "1"
@@ -5240,11 +5240,11 @@ printf '#include "stamp.h"\nconst char* day(void) { return STAMP; }\n' > "$WORK/
 for f in src hdr; do
   reset_cache
   l=$(mf_log "time-$f-1")
-  ( cd "$WORK/mf-time" && VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c "$f.c" -o "$f.o" ) 2>/dev/null
+  ( cd "$WORK/mf-time" && VCACHE_CXX_MANIFEST_TRACE=0 VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c "$f.c" -o "$f.o" ) 2>/dev/null
   check "$f.c: a time macro records no manifest state" \
     "$(grep -cE 'cxx manifest: not recording: .* uses __(TIME|DATE)__' "$l")" "1"
   l=$(mf_log "time-$f-2")
-  ( cd "$WORK/mf-time" && VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c "$f.c" -o "$f.o" ) 2>/dev/null
+  ( cd "$WORK/mf-time" && VCACHE_CXX_MANIFEST_TRACE=0 VCACHE_LOG="$l" "$VCACHE" gcc -O2 -c "$f.c" -o "$f.o" ) 2>/dev/null
   check "$f.c: the next compile never takes the manifest path" "$(manifest_hits)" "0"
   check "$f.c: it runs the preprocessor" "$(grep -c '\] preprocess: ' "$l")" "1"
 done
@@ -5399,7 +5399,7 @@ if command -v python3 >/dev/null 2>&1; then
   l=$(mf_log d2); VCACHE_DAEMON=on mf_compile "$WORK/mf-d" "$l" -MD -MF top.d
   check "a manifest hit through the daemon" "$(grep -c 'preprocessor skipped' "$l")" "1"
   check "and the daemon served its lookups" \
-    "$("$VCACHE" --daemon-status 2>/dev/null | awk '/^lookups/ {print ($NF >= 5)}')" "1"
+    "$("$VCACHE" --daemon-status 2>/dev/null | awk '/^lookups/ {print ($NF >= 4)}')" "1"
   "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
 fi
 
@@ -5621,8 +5621,8 @@ rm -f "$tl/calls"
 l=$(mf_log trace1); mf_traced "$l"
 check "a miss records from a trace" "$(grep -c 'cxx manifest: recorded from the trace' "$l")" "1"
 check "its compile runs under the tracer" "$(traced_calls)" "1"
-check "and so does its -E run, for the state a preprocessor hit would record" \
-  "$(grep -c 'vcache-fstrace\.so|.* -E main\.c$' "$tl/calls")" "1"
+check "the cold miss needs no -E run" \
+  "$(grep -c 'vcache-fstrace\.so|.* -E main\.c$' "$tl/calls" || true)" "0"
 check "and leaves no trace behind" \
   "$(find "$VCACHE_DIR" "$tl" -name 'trace*' | wc -l | tr -d ' ')" "0"
 calls_before=$(wc -l < "$tl/calls")
@@ -5639,24 +5639,25 @@ check "a read-only miss compiles untraced" \
 check "and preprocesses untraced" "$(grep -c '^none|.* -E main\.c$' "$tl/calls")" "1"
 
 # A trace that cannot be trusted to be whole is not used; the state comes from
-# the depfile, as it does where there is no tracer.
+# the depfile after preprocessing, as it does where there is no tracer.
+# Recache preserves this route; cold trace refusal is tested separately.
 if [[ -f "$WORK/stub-tracer.so" ]]; then
   reset_cache
   l=$(mf_log trace-inc)
-  mf_traced "$l" STUB_MODE=incomplete VCACHE_TRACER="$WORK/stub-tracer.so"
+  mf_traced "$l" VCACHE_RECACHE=1 STUB_MODE=incomplete VCACHE_TRACER="$WORK/stub-tracer.so"
   check "an incomplete trace falls back to the depfile" \
     "$(grep -c 'the trace is incomplete; recording from the depfile' "$l")" "1"
   check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
   check "and the trace is left out of it" "$(grep -c 'recorded from the trace' "$l" || true)" "0"
   reset_cache
   l=$(mf_log trace-np)
-  mf_traced "$l" STUB_MODE=noprocs VCACHE_TRACER="$WORK/stub-tracer.so"
+  mf_traced "$l" VCACHE_RECACHE=1 STUB_MODE=noprocs VCACHE_TRACER="$WORK/stub-tracer.so"
   check "a trace naming no process falls back to the depfile" \
     "$(grep -c 'the trace names no process; recording from the depfile' "$l")" "1"
   check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
   reset_cache
   l=$(mf_log trace-rel)
-  mf_traced "$l" STUB_MODE=relative VCACHE_TRACER="$WORK/stub-tracer.so"
+  mf_traced "$l" VCACHE_RECACHE=1 STUB_MODE=relative VCACHE_TRACER="$WORK/stub-tracer.so"
   check "a trace with a relative record falls back to the depfile" \
     "$(grep -c 'the trace did not parse; recording from the depfile' "$l")" "1"
   check "which still records the state" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
@@ -5745,7 +5746,7 @@ EOF
     ( cd "$tl" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
         "$VCACHE" gcc -B "$tl/badwrap/" -O2 -c main.c -o m.o ) 2> "$2"
   }
-  l=$(mf_log badwrap1); mf_badwrap "$l" "$tl/badwrap1.err"
+  l=$(mf_log badwrap1); VCACHE_RECACHE=1 mf_badwrap "$l" "$tl/badwrap1.err"
   check "a refused tracer records the state from the depfile" \
     "$(grep -c 'ld.so refused the tracer in a process of the compile; recording from' "$l")" "1"
   check "and stores it" "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
@@ -5895,7 +5896,7 @@ if command -v gcc >/dev/null 2>&1 && ! cc_is_clang; then
     ( cd "$ut" && VCACHE_MAP_CWD=0 VCACHE_LOG="$1" \
         "$VCACHE" gcc -B "$ut/wrap/" -O2 -I inc -c main.c -o m.o ) 2>/dev/null
   }
-  l=$(mf_log untraced1); mf_untraced "$l"
+  l=$(mf_log untraced1); VCACHE_RECACHE=1 mf_untraced "$l"
   # The wrapper is a shell script, so the trace shows no front end either, and
   # that is the reason given first.
   check "gcc: a trace that never saw the preprocessor run falls back to the depfile" \
@@ -6274,7 +6275,8 @@ for cc in gcc clang; do
   fi
   reset_cache
   printf '/* one */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
-  l=$(mf_log "pphit1-$cc"); mf_pphit "$cc" "$l"
+  # Seed a preprocessed result explicitly; the cold-derived path has its own test below.
+  l=$(mf_log "pphit1-$cc"); mf_pphit "$cc" "$l" VCACHE_RECACHE=1
   check "$cc: the first compile misses and records a state" \
     "$(misses)/$(grep -c 'cxx manifest: stored 1 states' "$l")" "1/1"
   check "$cc: a miss records nothing from its -E run" \
@@ -6330,9 +6332,9 @@ fi
 if command -v gcc >/dev/null 2>&1; then
   reset_cache
   printf '/* one: __TIME__ */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
-  mf_pphit gcc "$(mf_log pphit-time1)"
+  mf_pphit gcc "$(mf_log pphit-time1)" VCACHE_CXX_MANIFEST_TRACE=0
   printf '/* two: __TIME__ */\n#define SIX 6\n' > "$WORK/mf-pphit/h.h"
-  l=$(mf_log pphit-time2); mf_pphit gcc "$l"
+  l=$(mf_log pphit-time2); mf_pphit gcc "$l" VCACHE_CXX_MANIFEST_TRACE=0
   check "a preprocessor hit on a header naming __TIME__ records nothing" \
     "$(grep -c '\] hit on disk$' "$l")/$(grep -c 'not recording: .*h\.h uses __TIME__' "$l")/$(grep -c 'stored [0-9] states' "$l" || true)" \
     "1/1/0"
@@ -6357,6 +6359,14 @@ if command -v clang >/dev/null 2>&1; then
     "$(grep -c '\] preprocess: .*pp\.d' "$l" || true)" "0"
 else
   skipped "clang: not installed"
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  if PYTHONDONTWRITEBYTECODE=1 python3 "$TOP/tests/cxx_cold_recording_test.py" "$VCACHE"; then
+    ok "cold recording and stale-manifest routing"
+  else
+    bad "cold recording and stale-manifest routing"
+  fi
 fi
 
 # --------------------------------------------------------------------------

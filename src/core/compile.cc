@@ -1451,8 +1451,13 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
                                      const CompilerId& compiler_id, const std::string& cwd,
                                      const std::string& cache_dir, const std::string& memo_dir,
                                      const std::vector<std::string>& keyed_pchs,
-                                     int64_t started_ns, bool scan_incbin) {
+                                     int64_t started_ns, bool scan_incbin,
+                                     bool require_trace = false) {
   RecordedInputs inputs;
+  if (require_trace && trace == nullptr) {
+    inputs.declined = "the cold recording compile has no complete trace";
+    return inputs;
+  }
   const std::optional<std::string> text = util::ReadFile(depfile_path);
   std::optional<DepFile> dep;
   if (text) dep = ParseDepFile(*text);
@@ -1505,6 +1510,10 @@ RecordedInputs ReadCxxManifestInputs(const std::string& depfile_path,
   }
   if (trace != nullptr) {
     if (auto untraced = FindUntracedFile(inputs.files, roots, *trace)) {
+      if (require_trace) {
+        inputs.declined = "the cold recording trace does not show " + *untraced + " being read";
+        return inputs;
+      }
       VCACHE_LOG("cxx manifest: the trace does not show " + *untraced +
                  " being read; recording from the depfile");
     } else {
@@ -1842,44 +1851,57 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   if (!manifest_key.empty() && !config.read_only && !config.recache) {
     pp_recording = PlanCxxPreprocessRecording(config, compiler_id, parsed, *temp_dir);
   }
+  // PCH producers need -E for their portable identity. PCH consumers can name
+  // headers in the depfile that the compile never reads, so their recording
+  // cannot prove trace coverage. Keep their existing preprocessor fallback.
+  const bool cold_recording = manifest_states.empty() && !parsed.produces_pch &&
+                              keyed_pchs.empty() && pp_recording &&
+                              pp_recording->declined.empty() && !pp_recording->tracer.empty();
   const std::vector<std::string> pp_cmd =
       pp_recording ? BuildPreprocessCommand(parsed, roots, compiler_id, pp_recording->depfile,
                                             pp_recording->absent_list)
                    : BuildPreprocessCommand(parsed, roots, compiler_id);
-  VCACHE_LOG("preprocess: " + util::Join(pp_cmd, " "));
-
   util::ProcOptions pp_options{
       .capture_stdout = true, .capture_stderr = true, .stdout_file = preprocessed};
   if (pp_recording && !pp_recording->trace_log.empty()) {
     pp_options.env.emplace_back("VCACHE_TRACE_LOG", pp_recording->trace_log);
     pp_options.env.emplace_back("LD_PRELOAD", pp_recording->tracer);
   }
-  util::ProcResult pp = util::Run(pp_cmd, pp_options);
-  if (pp_recording && !pp_recording->trace_log.empty()) {
-    pp.stderr_data = WithoutPreloadRefusals(pp.stderr_data, pp_recording->tracer,
-                                            &pp_recording->preload_refused);
+  std::optional<util::ProcResult> pp;
+  if (cold_recording) {
+    VCACHE_LOG("cxx manifest: cold recording compile; no preprocessing");
+  } else {
+    VCACHE_LOG("preprocess: " + util::Join(pp_cmd, " "));
+    pp = util::Run(pp_cmd, pp_options);
+  }
+  if (pp && pp_recording && !pp_recording->trace_log.empty()) {
+    pp->stderr_data = WithoutPreloadRefusals(pp->stderr_data, pp_recording->tracer,
+                                             &pp_recording->preload_refused);
   }
   // A compile the preprocessor cannot handle can still be cached from what the
   // compile itself reads: a PCH consumer whose command lacks an include path
   // the PCH's header text needs compiles, and fails only under -E. Only an
   // error the compiler reported (status 1) qualifies; a tool that could not
   // run or crashed gets the original command line, as before.
-  const bool derive_key = pp.exit_code == 1 && !manifest_key.empty() && !config.read_only;
+  const bool derive_key = cold_recording ||
+                         (pp->exit_code == 1 && !manifest_key.empty() && !config.read_only);
   const std::string pp_failure =
-      pp.exit_code != 0
-          ? "exit code " + std::to_string(pp.exit_code) + ": " + pp.stderr_data.substr(0, 512)
+      pp && pp->exit_code != 0
+          ? "exit code " + std::to_string(pp->exit_code) + ": " + pp->stderr_data.substr(0, 512)
           : "";
   std::string key;
   std::string pch_identity;
-  if (pp.exit_code != 0 && !derive_key) {
+  if (pp && pp->exit_code != 0 && !derive_key) {
     // The compilation itself will fail too; let the compiler produce the real
     // diagnostics rather than reporting a vcache-shaped error.
     RecordDecision(cache_dir, {Reason::kPreprocessorError, pp_failure});
     return RunPassthrough(argv);
   }
   if (derive_key) {
-    VCACHE_LOG("cxx manifest: preprocessing failed; deriving the key from what the compile "
-               "reads: " + pp_failure);
+    if (!cold_recording) {
+      VCACHE_LOG("cxx manifest: preprocessing failed; deriving the key from what the compile "
+                 "reads: " + pp_failure);
+    }
   } else {
     bool saw_incbin = false;
     key = ComputeKey(parsed, roots, compiler_id, config, native_target, preprocessed,
@@ -1946,9 +1968,9 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
       }
     }
   }
-  // Counted once the compile succeeds when the key is derived: until then this
-  // is the preprocessor failure it was before the manifest existed.
-  if (!derive_key) RecordCounter(cache_dir, Counter::kMiss);
+  // A failed -E fallback remains a preprocessor failure until recording
+  // succeeds. Deliberately skipping -E is a miss even when the compile fails.
+  if (!derive_key || cold_recording) RecordCounter(cache_dir, Counter::kMiss);
 
   // Compile to a temporary and move into place only on success, so a failed
   // build never leaves a half-written object where make expects a good one.
@@ -1972,10 +1994,11 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   // and probes goes into a state; what the -E run saw is dropped.
   const bool list_available = CompilerWritesAbsentList(config, compiler_id, parsed);
   const std::string manifest_tracer =
-      records_manifest
-          ? CxxManifestTracer(config, list_available ? "the compiler's absent list"
-                                                     : "the depfile")
-          : "";
+      cold_recording ? pp_recording->tracer
+                     : records_manifest
+                           ? CxxManifestTracer(config, list_available ? "the compiler's absent list"
+                                                                      : "the depfile")
+                           : "";
   if (records_manifest && manifest_tracer.empty() && !list_available) {
     LogAbsentListUnused(config, compiler_id);
   }
@@ -2038,7 +2061,7 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
       }
     }
     VCACHE_LOG("compile failed with exit code " + std::to_string(compiled.exit_code));
-    if (derive_key) {
+    if (derive_key && !cold_recording) {
       RecordDecision(cache_dir, {Reason::kPreprocessorError, pp_failure});
     } else {
       RecordCounter(cache_dir, Counter::kCompileFailed);
@@ -2102,7 +2125,8 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
         manifest_inputs = ReadCxxManifestInputs(
             manifest_depfile, traced ? &*traced : nullptr,
             absent_from_list ? &*absent_from_list : nullptr, parsed, roots, compiler_id, cwd,
-            cache_dir, memo_dir, keyed_pchs, started_ns, /*scan_incbin=*/derive_key);
+            cache_dir, memo_dir, keyed_pchs, started_ns, /*scan_incbin=*/derive_key,
+            /*require_trace=*/cold_recording);
       }
     }
     if (!manifest_inputs.declined.empty()) {
@@ -2111,10 +2135,11 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   }
   if (derive_key) {
     if (!manifest_inputs.declined.empty()) {
-      RecordDecision(cache_dir, {Reason::kPreprocessorError, pp_failure});
-      return compiled.exit_code;
+      if (!cold_recording) RecordDecision(cache_dir, {Reason::kPreprocessorError, pp_failure});
+      return media_failed && config.error_on_cache_media_failure ? kCacheMediaFailureExit
+                                                                : compiled.exit_code;
     }
-    RecordCounter(cache_dir, Counter::kMiss);
+    if (!cold_recording) RecordCounter(cache_dir, Counter::kMiss);
     key = DeriveCxxResultKey(manifest_key, manifest_inputs.files);
     VCACHE_LOG("derived key " + key + " for " + parsed.source + " -> " + parsed.output);
   }

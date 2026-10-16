@@ -295,6 +295,30 @@ the same kinds of inputs whichever way it was recorded, so the manifest format
 and its key version are unchanged.
 
 
+**Cold recording.** When the manifest contains no usable stored states (absent,
+empty or undecodable), an eligible writable, traced compile can run once without
+`-E`. The same recording eligibility checks require a full `-MD` depfile and
+the original working directory. Read-only and recache runs retain their old
+path. PCH producers need preprocessing for their portable identity, while PCH
+consumers can list headers they do not read; producers and commands with an
+identified PCH therefore keep their existing path.
+Untraced and absent-list-only recording is unchanged. A cold recording requires
+a complete trace covering the depfile, checks volatile inputs, `.incbin` and
+changed-during-run files, and stores neither a result nor a state if recording
+is declined. The fresh output and real compiler status are still returned.
+It counts a miss and any real compile failure, never a skipped-preprocess failure.
+
+The [Sunbird measurement report](cxx-cold-recording.md) records the PCH limitation,
+paired timings and invocation/byte-identity evidence.
+
+The cold result uses the existing derived-key family. Single-flight callers
+lease the manifest identity; a waiter reloads and validates the leader's state.
+Stored stale states and matching states with missing, corrupt or incomplete
+results retain the `-E` lookup. Thus the first benign header edit after a cold
+fill can compile to seed a preprocessor-key entry; later benign edits can hit
+that entry and record a state. The two key families may hold duplicate objects.
+No hashed input or serialization changes, so no key namespace changes.
+
 **Result keys.** When `-E` succeeds the result is stored under the ordinary
 preprocessor key, and the state names that key. A tree with the manifest off
 hits what a tree with it on stored, and the reverse; the two modes only differ
