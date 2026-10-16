@@ -92,7 +92,7 @@ git checkout fbg && git merge --no-ff feat/<slug> && git push origin fbg:fbg
 
 Merging a new upstream release: `git merge upstream/main` into `fbg` (conflicts so far
 have been adjacent additions in `core/config.{h,cc}` and the test includes), run
-`make test`, then rebuild the binaries (below). Upstream issues we filed: #21, #23, #24 (the daemon scheduler proposal, epic `vcache-cug`); the
+`make test`, then deploy the binaries (below). Upstream issues we filed: #21, #23, #24 (the daemon scheduler proposal, epic `vcache-cug`); the
 feature requests #12–#20 are ours too.
 
 ## Git
@@ -206,11 +206,20 @@ Any PR must keep both at zero failures.
 
 ### Installed binaries
 
-The repos consume `~/fbg/vcache/dist/{host,el10,dc-build}/vcache`, not `bin/`. Rebuild
-all three from `fbg` with `git -C ~/fbg/vcache pull --ff-only` and then
-`~/fbg/devtools/scripts/host-setup-buildcache.sh --force` (host build here; el10 and
-dc-build from a `git archive` of HEAD inside the images; the old binary is kept as
-`vcache.prev`). The script builds whatever `~/fbg/vcache` has checked out; it does not pull. Stores live under `/build/<user>/cache/vcache/<os>`; `--show-stats` needs
+The repos consume `~/fbg/vcache/dist/{host,el10,dc-build}/vcache`, not `bin/`. Bring
+`~/fbg/vcache` to the merged `fbg` (`git -C ~/fbg/vcache pull --ff-only`). The next build
+that sources devtools' `scripts/vcache-env.sh` then runs `scripts/vcache-update.sh` for its
+OS: devtools `build-run`, sunbird `build.sh`/`run_tests.sh`, and `container.run.sh` for el10.
+When that OS's `vcache.commit` is not HEAD, the script prints a line saying it is rebuilding
+and how long the last rebuild took, then rebuilds and installs the binary. It does this only
+on branch `fbg`, and for host only with a clean tree. It skips a commit that changes only
+`.beads/` or `*.md`.
+
+To rebuild every OS now, run `~/fbg/devtools/scripts/host-setup-buildcache.sh`. It builds host
+here, and el10 and dc-build from a `git archive` of HEAD inside the images. Each old binary is
+kept as `vcache.prev`. Add `--force` only to rebuild a binary already built from HEAD, or to
+build uncommitted changes. Both paths build whatever `~/fbg/vcache` has checked out; neither
+pulls. Stores live under `/build/<user>/cache/vcache/<os>`; `--show-stats` needs
 `VCACHE_DIR` and the same `VCACHE_CACHE_SIZE` the builds use, or a running daemon refuses
 the client.
 
@@ -248,4 +257,5 @@ environment. Resolve compiler executable names there before running the tests.
 2. **Run the gate**: `make test` on the branch you will push.
 3. **Commit** (see "Commit messages"), including `.beads/issues.jsonl` when beads changed.
 4. **Push** the feature branch; merge to `fbg` with `--no-ff` and push `fbg:fbg`.
-5. **Rebuild `dist/`** if a merged change ends with `Deploy: vcache`.
+5. **Deploy** a merged change that ends with `Deploy: vcache`: bring `~/fbg/vcache` to `fbg`, and the next build rebuilds
+   `dist/` (see "Installed binaries").
