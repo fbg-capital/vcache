@@ -124,3 +124,20 @@ counter undercounted compiler calls. The final rounds reject those conditions.
 The machine was shared throughout; three observations are not a statistical
 confidence interval. These results do not justify changing Sunbird's default
 C/C++ cache or broadening the optimization to PCH/untraced recording.
+
+## Installed verification
+
+The merged `fbg` gate also passed: 1470 unit, 1321 integration and 93 link
+verification checks plus the auxiliary suites. All three `dist/` variants were
+rebuilt from the merged code. Host and EL10 each passed the 50-check GCC/Clang
+matrix; dc-build passed 25 checks with GCC 11.2.1. Its Python 3.6 driver only
+substituted the older subprocess argument spelling. EL10 cargo 1.97.1 loaded
+successfully under the installed tracer.
+
+The dc-build image also contains Clang 3.4.2, which rejects `-ffile-prefix-map`
+with both the original and new binaries. That compiler is not validated for this
+feature; its existing compatibility failure is retained in the evidence.
+`installed-binaries.json` records installed revisions and SHA256 values, including
+that any revision difference from merge `d393550` changes only tracker metadata.
+`gate-merged.log`, `installed-host.log`, `installed-el10.log`,
+`installed-dc-gcc.log` and `dc-clang-previous.log` retain the checks.
