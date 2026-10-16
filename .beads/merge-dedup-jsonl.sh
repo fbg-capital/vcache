@@ -26,7 +26,12 @@
 # ours' id, as above. A field merge would take its stale status as a one-sided
 # change wherever the newer side moved it back to the base value, and reopen the
 # issue without a conflict. Without such a comment nothing shows the newer side
-# saw the older one, and the field merge runs.
+# saw the older one, and the field merge runs. The comments show only what the
+# newer side saw up to the older side's last comment: an older side whose
+# updated_at is a later second than that comment changed again after it, perhaps
+# unseen (a separate DB that imported the comment). If it also changed a field
+# from the base that the newer side does not hold, the row conflicts, naming the
+# fields, instead of a silent pick of either side.
 #
 # Comment ids are unique in the output: a later duplicate gets a fresh id above
 # every input's maximum.
@@ -141,6 +146,22 @@ def superseded($stale; $fresh; $base_row):
         | all($sk[]; $fi[.] != null) and any($sk[]; $oi[.] == null)
     end;
 
+# br stamps updated_at when it adds a comment; comment created_at has whole seconds.
+def edited_after_last_comment($row):
+    ($row.updated_at | stamp | .[0:19]) > ([$row.comments[] | objects | .created_at | stamp | .[0:19]] | max // "");
+# Fields $stale changed from the base that $fresh does not hold: what taking $fresh would lose.
+def lost_fields($stale; $fresh; $base_row):
+    ($base_row // {}) as $o
+    | [[$stale, $fresh, $o] | map(keys_unsorted[]) | dedupe_keys | .[]
+        | select(IN("comments", "updated_at", "created_at", "source_repo_path") | not)
+        | . as $key | select(slot($stale; $key) != slot($o; $key) and slot($stale; $key) != slot($fresh; $key))];
+def take_newer($side; $stale; $fresh; $base_row; $row):
+    lost_fields($stale; $fresh; $base_row) as $lost
+    | if edited_after_last_comment($stale) and ($lost | length) > 0 then
+          clash($row.id; $row.ours; $row.theirs; "\($side) is older and was edited after its last comment: \($lost | join(", "))")
+      else {record: ($fresh | .comments = merge_comments($row.ours.comments; $row.theirs.comments))}
+      end;
+
 def newer_updated_at($x; $y):
     if ($y.updated_at | stamp) > ($x.updated_at | stamp) then $y.updated_at
     elif ($x | has("updated_at")) then $x.updated_at
@@ -214,8 +235,8 @@ INDEX($ours[]; .id) as $a
             else {record: $x}
             end
         elif ($has_base | not) then clash($id; $x; $y; "no merge base")
-        elif superseded($y; $x; $base_row) then {record: ($x | .comments = merge_comments($x.comments; $y.comments))}
-        elif superseded($x; $y; $base_row) then {record: ($y | .comments = merge_comments($x.comments; $y.comments))}
+        elif superseded($y; $x; $base_row) then take_newer("theirs"; $y; $x; $base_row; {id: $id, ours: $x, theirs: $y})
+        elif superseded($x; $y; $base_row) then take_newer("ours"; $x; $y; $base_row; {id: $id, ours: $x, theirs: $y})
         elif $base_row == null then clash($id; $x; $y; "no base row")
         elif ((same($x; $base_row) | not) and (same($y; $base_row) | not)) then
             merge_fields($base_row; $x; $y) as $merge
