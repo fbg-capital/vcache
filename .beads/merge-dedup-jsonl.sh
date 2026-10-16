@@ -18,6 +18,16 @@
 # author, created_at and text, ours' ids first. updated_at is the newer of the
 # two; created_at and source_repo_path are ours.
 #
+# Before that, a row changed on both sides whose one side is a snapshot the other
+# has moved past is taken whole from the newer side. That side is newer by
+# updated_at and holds every comment of the older side, and the older side added
+# a comment since the base (any comment, for a row new on both sides). This is an
+# export of a shared beads DB taken mid-run; a comment both sides hold keeps
+# ours' id, as above. A field merge would take its stale status as a one-sided
+# change wherever the newer side moved it back to the base value, and reopen the
+# issue without a conflict. Without such a comment nothing shows the newer side
+# saw the older one, and the field merge runs.
+#
 # Comment ids are unique in the output: a later duplicate gets a fresh id above
 # every input's maximum.
 #
@@ -118,6 +128,19 @@ def merge_comments($a; $b):
     | INDEX($ac[]; comment_key) as $ai
     | $ac + [$bc[] | select($ai[comment_key] == null)];
 
+# $stale is older than $fresh, $fresh holds every comment of $stale, and $stale added one since the base: $fresh
+# has seen $stale, so $stale is a snapshot of a shared DB exported mid-run, not an independent edit.
+def comment_list: if type == "array" then . else [] end;
+def superseded($stale; $fresh; $base_row):
+    if ($stale.comments | type) != "array" or ($stale.updated_at | stamp) == "" or (older_than($stale; $fresh) | not)
+    then false
+    else
+        INDEX($fresh.comments | comment_list | .[]; comment_key) as $fi
+        | INDEX($base_row.comments? | comment_list | .[]; comment_key) as $oi
+        | ($stale.comments | map(comment_key)) as $sk
+        | all($sk[]; $fi[.] != null) and any($sk[]; $oi[.] == null)
+    end;
+
 def newer_updated_at($x; $y):
     if ($y.updated_at | stamp) > ($x.updated_at | stamp) then $y.updated_at
     elif ($x | has("updated_at")) then $x.updated_at
@@ -159,7 +182,7 @@ def merge_fields($o; $x; $y):
     | if ([$x, $y] | any(has("updated_at"))) then .row.updated_at = newer_updated_at($x; $y) else . end;
 
 def renumber_comment_ids($max_id):
-    reduce range(0; length) as $i ({plan: ., seen: {}, next: $max_id + 1};
+    reduce range(0; length) as $i ({plan: ., seen: {}, next: ($max_id + 1)};
         if (.plan[$i].record.comments | type) != "array" then .
         else reduce range(0; .plan[$i].record.comments | length) as $j (.;
             (.plan[$i].record.comments[$j] | if type == "object" then .id else null end) as $cid
@@ -191,6 +214,8 @@ INDEX($ours[]; .id) as $a
             else {record: $x}
             end
         elif ($has_base | not) then clash($id; $x; $y; "no merge base")
+        elif superseded($y; $x; $base_row) then {record: ($x | .comments = merge_comments($x.comments; $y.comments))}
+        elif superseded($x; $y; $base_row) then {record: ($y | .comments = merge_comments($x.comments; $y.comments))}
         elif $base_row == null then clash($id; $x; $y; "no base row")
         elif ((same($x; $base_row) | not) and (same($y; $base_row) | not)) then
             merge_fields($base_row; $x; $y) as $merge
