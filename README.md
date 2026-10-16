@@ -310,8 +310,13 @@ roots and any precompiled header the command names, and each state in it lists
 the files an earlier compile read, with their digests, the paths it probed and
 did not find, and the key that compile stored under. When every file of a state
 still hashes the same and every one of those paths is still absent, that key is
-looked up and the preprocessor never runs. The key is the ordinary preprocessor
-key, so trees with the manifest on and off share entries. A miss records its
+looked up and the preprocessor never runs. With no stored states, an eligible,
+writable traced compile also skips preprocessing: it derives the result key from
+the recorded inputs. Stale states and unusable results retain the preprocessor
+lookup. A cold-derived result has no preprocessor-key entry yet, so the first
+comment-only header edit can compile again; later benign edits can hit the
+seeded preprocessor entry and record a new state. Preprocessor-key entries are
+shared with manifest-off mode; derived entries require a manifest. A miss records its
 state from the compile's own `-MD` output, which vcache requests when the build
 did not, and on Linux from a trace of the compile through `vcache-fstrace.so`,
 which sees what the preprocessor looked for and did not find. The trade is
