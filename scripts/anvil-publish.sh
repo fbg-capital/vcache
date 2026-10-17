@@ -9,19 +9,21 @@
 #   --dry-run  resolve the commit, the image and the toolchains, then print every step without running any of them.
 #   --keep     keep the work directory; it is always kept when a step fails.
 #
-# The source is `git archive <commit>`, never the working tree. fedora44 builds natively with the newest gcc-N of the
-# fedora44 toolchain tree, el10 in the el10 image with the el10 tree mounted at /opt/infra, both through build-limited.
+# The source is `git archive <commit>`, never the working tree, and the commit must carry anvil.toml. fedora44 builds
+# natively with the newest gcc-N of the fedora44 toolchain tree, under `env -i` with PATH=/usr/bin:/bin and only the
+# variables the build needs; el10 in the el10 image with the el10 tree mounted at /opt/infra; both through build-limited.
 # Both trees ship libstdc++.a; the host compiler may not, and then vcache's Makefile links the C++ runtime dynamically.
 # Source paths are mapped to `.`, so a target's bytes depend on the source and the toolchain only, and publishing a
 # commit again is reported as already published. Before anything is published, each target must link libstdc++ and
 # libgcc statically, and run `vcache --version` and load its tracer where it runs: on this host, and in the el10 image
 # (with the tree its entry point requires, but none of the tree's libraries on the library path). The build record
-# (commit, image digest, toolchains, file hashes) is printed before the publish.
+# (commit, image digest, toolchains, the ld, as, cmake and glibc each build saw, file hashes) is printed before the publish.
 #
 # Environment:
 #   ANVIL                  the anvil binary (default: anvil on PATH)
 #   VCACHE_BUILD_LIMITED   the build wrapper (default ~/bin/build-limited)
-#   VCACHE_EL10_IMAGE      the el10 image (default sun_container:el10); <name>@sha256:<digest> pins one
+#   VCACHE_EL10_IMAGE      the el10 image (default sun_container:el10); <name>@sha256:<digest> pins one, matched against
+#                          the image's digest and its repo digests
 #   VCACHE_EL10_INFRA      the el10 toolchain tree (default /opt/infra.el10)
 #   VCACHE_FEDORA44_INFRA  the fedora44 toolchain tree (default /opt/infra.fedora44)
 #   VCACHE_PUBLISH_ROOT    where the work directory is made (default /build/$USER/cache/vcache-build)
@@ -38,6 +40,7 @@ publish_root=${VCACHE_PUBLISH_ROOT:-/build/${USER:-$(id -un)}/cache/vcache-build
 os_release=${VCACHE_OS_RELEASE:-/etc/os-release}
 # vcache's -O3 LTO Boost.Spirit units take several GB each; build-limited's MAKEFLAGS is sized for the whole slice.
 build_jobs=8
+fedora44_path=/usr/bin:/bin
 branch=fbg
 targets=(fedora44 el10)
 
@@ -106,7 +109,8 @@ getHostTag() (
 # Sets commit to the full name of --commit, or of origin's fbg tip, and refuses one that is not on origin/fbg.
 resolveCommit() {
   local tip
-  git -C "$repo" fetch --quiet origin "$branch" || die "cannot fetch $branch from origin in $repo"
+  git -C "$repo" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" ||
+    die "cannot fetch $branch from origin in $repo"
   tip=$(git -C "$repo" rev-parse --verify "refs/remotes/origin/$branch^{commit}")
   if [[ -z $commit_arg ]]; then
     commit=$tip
@@ -116,6 +120,9 @@ resolveCommit() {
     die "no commit $commit_arg in $repo, even after fetching origin"
   git -C "$repo" merge-base --is-ancestor "$commit" "$tip" ||
     die "$commit is not on origin/$branch; vcache:1 is what every consumer build runs, so only merged commits are published"
+  # The major comes from the commit itself, never from a working tree.
+  git -C "$repo" cat-file -e "$commit:anvil.toml" 2>/dev/null ||
+    die "${commit:0:12} has no anvil.toml, so it names no major; publish a commit that carries it"
 }
 
 # getNewestGcc <tree>: the highest N of the tree's bin/gcc-N.
@@ -140,11 +147,14 @@ describeTree() {
 
 # Sets el10_image_id to the image's id, which every podman run uses, so a retag during the run changes nothing.
 resolveImage() {
-  local digest
-  read -r el10_image_id digest < <(podman image inspect --format '{{.Id}} {{.Digest}}' "$el10_image") ||
+  local digest repo_digests pinned
+  read -r el10_image_id digest repo_digests < <(podman image inspect \
+    --format '{{.Id}} {{.Digest}} {{range .RepoDigests}}{{.}} {{end}}' "$el10_image") ||
     die "no image $el10_image (podman image inspect failed)"
-  if [[ $el10_image == *@sha256:* && $digest != "${el10_image##*@}" ]]; then
-    die "$el10_image resolves to digest $digest"
+  if [[ $el10_image == *@sha256:* ]]; then
+    pinned=${el10_image##*@}
+    [[ $digest == "$pinned" || " $repo_digests " == *"@$pinned "* ]] ||
+      die "$el10_image resolves to digest $digest and repo digests ${repo_digests:-none}"
   fi
   record_image="$el10_image = digest $digest, id $el10_image_id"
 }
@@ -166,33 +176,41 @@ exportSource() {
   done
 }
 
-# The /usr/lib64/ccache masquerade loops with vcache's own compiler-wrapper probe.
-getPathWithoutCcache() {
-  tr ':' '\n' <<<"$PATH" | grep -v '^/usr/lib64/ccache$' | paste -sd:
+# The fedora44 build's whole environment besides CC, CXX and the flags: nothing comes from the caller's (no ccache
+# masquerade, no CPATH or LD_LIBRARY_PATH), and its HOME is the work directory's.
+getFedora44Env() {
+  printf '%s\n' PATH="$fedora44_path" HOME="$work/home" LC_ALL=C MAKEFLAGS="-j$build_jobs"
 }
 
 buildFedora44() {
-  local src=$work/fedora44 map
+  local src=$work/fedora44 map build_env
   map="-ffile-prefix-map=$src=."
   step "build fedora44 natively with $fedora44_infra/bin/gcc-$gcc_fedora44"
   exportSource "$src"
-  run "$build_limited" env -C "$src" PATH="$(getPathWithoutCcache)" MAKEFLAGS="-j$build_jobs" \
+  run mkdir -p -- "$work/home"
+  mapfile -t build_env < <(getFedora44Env)
+  run "$build_limited" env -i -C "$src" "${build_env[@]}" \
     CC="$fedora44_infra/bin/gcc-$gcc_fedora44 $map" CXX="$fedora44_infra/bin/g++-$gcc_fedora44 $map" \
     CFLAGS="$map" CXXFLAGS="$map" bash -c "set -e; ./third-party/fetch.sh && make -j$build_jobs all"
 }
 
+# The el10 build's environment inside the image, besides CC, CXX and the flags.
+getEl10Env() {
+  printf '%s\n' -e "MAKEFLAGS=-j$build_jobs" -e HOME=/tmp -e PATH=/opt/infra/bin:/usr/local/bin:/usr/bin:/bin \
+    -e LD_LIBRARY_PATH=/opt/infra/lib64:/opt/infra/lib
+}
+
 # The container joins build-limited's slice, which build-limited names in HS_BUILD_SLICE.
 buildEl10() {
-  local src=$work/el10 map
+  local src=$work/el10 map build_env
   map="-ffile-prefix-map=$src=."
   step "build el10 in $el10_image with $el10_infra/bin/gcc-$gcc_el10 at /opt/infra"
   exportSource "$src"
+  mapfile -t build_env < <(getEl10Env)
   # shellcheck disable=SC2016 # expanded inside build-limited, which sets HS_BUILD_SLICE
   run "$build_limited" bash -c 'exec podman run ${HS_BUILD_SLICE:+--cgroup-parent="$HS_BUILD_SLICE"} "$@"' podman-run \
     --rm --userns=keep-id --user "$(id -u):$(id -g)" -v "$src:$src:Z" -v "$el10_infra:/opt/infra:ro" -w "$src" \
-    -e "MAKEFLAGS=-j$build_jobs" -e HOME=/tmp -e PATH=/opt/infra/bin:/usr/local/bin:/usr/bin:/bin \
-    -e LD_LIBRARY_PATH=/opt/infra/lib64:/opt/infra/lib -e "CC=gcc-$gcc_el10 $map" -e "CXX=g++-$gcc_el10 $map" \
-    -e "CFLAGS=$map" -e "CXXFLAGS=$map" \
+    "${build_env[@]}" -e "CC=gcc-$gcc_el10 $map" -e "CXX=g++-$gcc_el10 $map" -e "CFLAGS=$map" -e "CXXFLAGS=$map" \
     "$el10_image_id" bash -c "set -e; ./third-party/fetch.sh && make -j$build_jobs all"
 }
 
@@ -203,14 +221,9 @@ layOut() {
     run install -D -m 555 -- "$work/$tag/bin/vcache" "$out/$tag/vcache"
     run install -D -m 555 -- "$work/$tag/bin/vcache-fstrace.so" "$out/$tag/vcache-fstrace.so"
   done
-  # anvil.toml beside the targets gives the major. The work directory is outside git, so anvil sends --commit as given
-  # instead of resolving it in a checkout, whose HEAD and tracked changes have nothing to do with the archive.
-  if git -C "$repo" cat-file -e "$commit:anvil.toml" 2>/dev/null; then
-    run cp -- "$work/fedora44/anvil.toml" "$out/anvil.toml"
-  else
-    step "${commit:0:12} has no anvil.toml; using $repo/anvil.toml"
-    run cp -- "$repo/anvil.toml" "$out/anvil.toml"
-  fi
+  # The commit's anvil.toml beside the targets gives the major. The work directory is outside git, so anvil sends --commit
+  # as given instead of resolving it in a checkout, whose HEAD and tracked changes have nothing to do with the archive.
+  run cp -- "$work/fedora44/anvil.toml" "$out/anvil.toml"
 }
 
 # targetDir <tag>: where the target's files are, as seen by targetRun.
@@ -278,13 +291,25 @@ checkTargets() {
   check "el10 in $el10_image_id with $el10_infra at /opt/infra and no LD_LIBRARY_PATH: the same three" checkRuns el10
 }
 
+# Prints the first --version line of ld, as and cmake, and the glibc version, as the environment running it finds them.
+# shellcheck disable=SC2016 # runs in the build's environment
+tools_probe='for tool in ld as cmake; do printf "%s: %s; " "$tool" "$("$tool" --version 2>&1 | head -1)"; done
+  printf "glibc %s\n" "$(ldd --version 2>&1 | head -1 | sed "s/.* //")"'
+
 printRecord() {
-  local tag file
+  local tag file build_env tools_fedora44 tools_el10
   step "build record"
   printf '  commit    %s\n' "$commit"
   printf '  fedora44  native on %s, %s\n' "$host_tag" "$record_fedora44"
   printf '  el10      %s; %s\n' "$record_image" "$record_el10"
   ((is_dry_run)) && return 0
+  mapfile -t build_env < <(getFedora44Env)
+  tools_fedora44=$(env -i "${build_env[@]}" bash -c "$tools_probe") || die "cannot probe the fedora44 build's tools"
+  mapfile -t build_env < <(getEl10Env)
+  tools_el10=$(podman run --rm -v "$el10_infra:/opt/infra:ro" "${build_env[@]}" "$el10_image_id" bash -c "$tools_probe") ||
+    die "cannot probe the el10 build's tools"
+  printf '  fedora44  %s\n' "$tools_fedora44"
+  printf '  el10      %s\n' "$tools_el10"
   for tag in "${targets[@]}"; do
     for file in vcache vcache-fstrace.so; do
       printf '  %-8s  %s  %s\n' "$tag" "$(sha256sum <"$out/$tag/$file" | cut -d' ' -f1)" "$file"

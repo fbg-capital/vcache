@@ -233,12 +233,14 @@ vcache is also the artifact `vcache` in the FBG artifact store, anvil (`anvil.to
 1, targets `fedora44` and `el10`). After every merge to `fbg`, run
 `scripts/anvil-publish.sh` from a checkout of this repository on a fedora44 host (zeus,
 until a builder host does it). It publishes origin's `fbg` tip: it builds both targets from
-`git archive`, fedora44 natively with `/opt/infra.fedora44`'s newest `gcc-N` and el10 in
-`sun_container:el10` with `/opt/infra.el10`, all through `build-limited`. It checks that each
+`git archive`, fedora44 natively with `/opt/infra.fedora44`'s newest `gcc-N` under `env -i`
+(`PATH=/usr/bin:/bin` and only the variables the build needs) and el10 in `sun_container:el10`
+with `/opt/infra.el10`, all through `build-limited`. It checks that each
 target links libstdc++ statically and runs `vcache --version` and loads its tracer where it
-runs, prints the build record, then sends both targets in one `anvil publish`. Source paths
+runs, prints the build record (commit, image digest, compilers, the ld, as, cmake and glibc
+each build saw, file hashes), then sends both targets in one `anvil publish`. Source paths
 are mapped to `.`, so a merge that leaves the binaries unchanged is reported as already
-published. A commit not on `origin/fbg` is refused. `--dry-run` prints the steps and runs
+published. A commit not on `origin/fbg`, or without `anvil.toml`, is refused. `--dry-run` prints the steps and runs
 none of them; `--commit <sha>` publishes an earlier `fbg` commit. Raise `major` only when a
 change breaks how consumers call vcache.
 
