@@ -4119,6 +4119,77 @@ check "a marker whose name does not fit is a lost-record line in the log" \
 check "and no marker is made under a shortened name" \
   "$(ls "$(dirname "$long_log")" | grep -c '\.incomplete$')" "0"
 
+# A program that lowers RLIMIT_FSIZE to inject write failures of its own must
+# not cost the trace its records: the log is already past that size. The
+# tracer's appends go out above the program's soft limit, and the program still
+# sees its limit, its own EFBIG, and no SIGXFSZ from a write it did not make.
+# With the hard limit lowered too, nothing can lift it: the records are lost,
+# loudly, and the program is still not killed for them.
+mkdir -p "$WORK/tracer-fsize"
+printf 'input\n' > "$WORK/tracer-fsize/input"
+cat > "$WORK/tracer-fsize/fsize.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  const char *mode = argc > 1 ? argv[1] : "";
+  int owns_writes = strcmp(mode, "ignored") == 0;
+  if (owns_writes) signal(SIGXFSZ, SIG_IGN);
+  struct rlimit before;
+  if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
+  struct rlimit tiny = {8, strcmp(mode, "hard") == 0 ? 8 : before.rlim_max};
+  if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
+  if (owns_writes) {
+    int out = open("out", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (out < 0) return 12;
+    char data[64];
+    memset(data, 'x', sizeof data);
+    if (write(out, data, sizeof data) != 8) return 13;
+    if (write(out, data, 1) != -1 || errno != EFBIG) return 14;
+    close(out);
+  }
+  int input = open("input", O_RDONLY);
+  if (input < 0) return 15;
+  close(input);
+  int absent = open("absent", O_RDONLY);
+  if (absent >= 0 || errno != ENOENT) return 16;
+  struct rlimit after;
+  if (getrlimit(RLIMIT_FSIZE, &after) != 0) return 17;
+  if (after.rlim_cur != tiny.rlim_cur || after.rlim_max != tiny.rlim_max) return 18;
+  return 0;
+}
+EOF
+gcc "$WORK/tracer-fsize/fsize.c" -o "$WORK/tracer-fsize/fsize"
+fsize_traced() {
+  rm -f "$WORK/tracer-fsize/$1.trace" "$WORK/tracer-fsize/$1.trace.incomplete"
+  ( cd "$WORK/tracer-fsize" && VCACHE_TRACE_LOG="$WORK/tracer-fsize/$1.trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./fsize "$1" )
+}
+fsize_traced ignored
+check "a program's own small RLIMIT_FSIZE keeps its EFBIG and its limit under the tracer" "$?" "0"
+check "and its trace is complete" \
+  "$([[ -e "$WORK/tracer-fsize/ignored.trace.incomplete" ]] ||
+     grep -qx '!' "$WORK/tracer-fsize/ignored.trace" && echo lost || echo fine)" "fine"
+check "and records what it read and probed past the limit" \
+  "$(grep -cxF -e $'R\t'"$WORK/tracer-fsize/input" -e $'M\t'"$WORK/tracer-fsize/absent" \
+      "$WORK/tracer-fsize/ignored.trace")" "2"
+check "and its own write still stops at its limit" \
+  "$(wc -c < "$WORK/tracer-fsize/out")" "8"
+fsize_traced default
+check "a program that leaves SIGXFSZ at its default is not killed by the tracer's writes" "$?" "0"
+check "and its trace is complete" \
+  "$([[ -e "$WORK/tracer-fsize/default.trace.incomplete" ]] && echo lost || echo fine)" "fine"
+check "and holds its records" \
+  "$(grep -cxF -e $'R\t'"$WORK/tracer-fsize/input" -e $'M\t'"$WORK/tracer-fsize/absent" \
+      "$WORK/tracer-fsize/default.trace")" "2"
+fsize_traced hard
+check "a hard RLIMIT_FSIZE below the log does not get the program killed either" "$?" "0"
+check "and the trace is marked incomplete" \
+  "$([[ -e "$WORK/tracer-fsize/hard.trace.incomplete" ]] && echo lost || echo fine)" "lost"
+
 if [[ "$(id -u)" != 0 ]]; then
   mkdir -p "$WORK/tracer-sealed"
   cat > "$WORK/tracer-sealed/seal.c" <<'EOF'

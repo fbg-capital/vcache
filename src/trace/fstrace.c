@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -93,15 +94,108 @@ static void ensure_log(void) {
   }
 }
 
+/* 1 when all `n` bytes landed in one write. */
+static int write_whole(const char *buf, size_t n) {
+  for (;;) {
+    long r = syscall(SYS_write, log_fd, buf, n);
+    if (r == (long)n) return 1;
+    if (r < 0 && errno == EINTR) continue;
+    return 0;
+  }
+}
+
+/* Set once any record finds a finite soft RLIMIT_FSIZE; from then on every
+   record of the process goes through the lock below. A record that read an
+   infinite limit while another thread had lifted it would otherwise write
+   after that thread put the program's limit back. */
+static int fsize_limit_seen;
+
+/* Held across lift, write and restore, because the limit is process-wide: a
+   second thread lifting inside the window would read the lifted value as the
+   program's and restore that. The tag is pid and tid. A signal handler that
+   records inside the window finds its own tag and nests, which is safe since
+   each lift restores what it read; a child forked inside the window finds its
+   parent's pid and takes the lock over (it inherits the lifted limit too). */
+static uint64_t fsize_lock;
+
+static uint64_t fsize_lock_tag(void) {
+  return ((uint64_t)(uint32_t)syscall(SYS_getpid) << 32) | (uint32_t)syscall(SYS_gettid);
+}
+
+/* 1 when the caller took the lock and must release it, 0 when it nests. */
+static int fsize_lock_acquire(uint64_t self) {
+  for (;;) {
+    uint64_t holder = 0;
+    if (__atomic_compare_exchange_n(&fsize_lock, &holder, self, 0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
+      return 1;
+    }
+    if (holder == self) return 0;
+    if ((holder >> 32) != (self >> 32) &&
+        __atomic_compare_exchange_n(&fsize_lock, &holder, self, 0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
+      return 1;
+    }
+    syscall(SYS_sched_yield);
+  }
+}
+
+static int prlimit_fsize(const struct rlimit64 *next, struct rlimit64 *now) {
+  return (int)syscall(SYS_prlimit64, 0, RLIMIT_FSIZE, next, now);
+}
+
+/* A program may lower its soft RLIMIT_FSIZE to inject write failures, and the
+   log is usually past it already. The kernel would then fail every append
+   with EFBIG and raise SIGXFSZ, killing a program that left it at the default,
+   or cut a record that straddles the limit short. So the soft limit is lifted
+   to the hard one before the write rather than after a failure, and the
+   program's value is put back after it. Its own writes in other threads see
+   the lifted limit for that window. When even the hard limit leaves no room
+   (an estimate: other processes append too), the record is dropped unwritten:
+   lost, but no signal. 1 when the whole record landed. */
+static int append_record(const char *buf, size_t n) {
+  struct rlimit64 program_limit;
+  if (!__atomic_load_n(&fsize_limit_seen, __ATOMIC_SEQ_CST)) {
+    if (prlimit_fsize(NULL, &program_limit) != 0) return write_whole(buf, n);
+    if (program_limit.rlim_cur == RLIM64_INFINITY &&
+        !__atomic_load_n(&fsize_limit_seen, __ATOMIC_SEQ_CST)) {
+      return write_whole(buf, n);
+    }
+    __atomic_store_n(&fsize_limit_seen, 1, __ATOMIC_SEQ_CST);
+  }
+
+  uint64_t self = fsize_lock_tag();
+  int owns_lock = fsize_lock_acquire(self);
+  int written = 0;
+  if (prlimit_fsize(NULL, &program_limit) != 0 ||
+      program_limit.rlim_cur == RLIM64_INFINITY) {
+    written = write_whole(buf, n);
+  } else {
+    const struct rlimit64 lifted = {program_limit.rlim_max, program_limit.rlim_max};
+    int is_lifted = program_limit.rlim_cur < program_limit.rlim_max &&
+                    prlimit_fsize(&lifted, &program_limit) == 0;
+    rlim64_t limit = is_lifted ? lifted.rlim_cur : program_limit.rlim_cur;
+    long log_size = limit == RLIM64_INFINITY ? -1 : syscall(SYS_lseek, log_fd, 0, SEEK_END);
+    if (log_size < 0 || (uint64_t)log_size + n <= limit) written = write_whole(buf, n);
+    if (is_lifted) {
+      struct rlimit64 during;
+      if (prlimit_fsize(&program_limit, &during) == 0 &&
+          (during.rlim_cur != lifted.rlim_cur || during.rlim_max != lifted.rlim_max)) {
+        /* The program set its own limit inside the window; that one stands. */
+        prlimit_fsize(&during, NULL);
+      }
+    }
+  }
+  if (owns_lock) __atomic_store_n(&fsize_lock, 0, __ATOMIC_RELEASE);
+  return written;
+}
+
 /* A "!" line, which readers refuse the whole log on. It starts with a newline
    of its own: a torn record has none, and "R\t/x/ab!" would read as a record. */
 static void write_incomplete_sentinel(void) {
   ensure_log();
   if (log_fd < 0) return;
-  for (;;) {
-    long r = syscall(SYS_write, log_fd, "\n!\n", 3);
-    if (r >= 0 || errno != EINTR) return;
-  }
+  append_record("\n!\n", 3);
 }
 
 /* A lost record is not a lost log line: it is an input missing from the set
@@ -192,13 +286,7 @@ static void emit(char kind, const char *path) {
      file, where O_APPEND makes each write land whole and contiguous; a second
      write for the rest of a short one can land after another process's record
      and tear both. So a short write is a lost record, and is made loud. */
-  for (;;) {
-    long r = syscall(SYS_write, log_fd, buf, n);
-    if (r == (long)n) return;
-    if (r < 0 && errno == EINTR) continue;
-    mark_incomplete();
-    return;
-  }
+  if (!append_record(buf, n)) mark_incomplete();
 }
 
 /* Only ENOENT counts as a negative input. A permission error is a different
