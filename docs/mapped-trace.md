@@ -168,3 +168,26 @@ Timings precede the final legacy-mode bypass, fork-lifetime protections and
 descriptor/page-alignment refusal guards. Those changes were checked by regressions and the full gate; the timing
 tables are evidence for this transport design, not final-release speed claims.
 The final alignment precheck selects the same mapped mode on these 4 KiB-page hosts.
+
+## Delivery
+
+Merged source: `180d20c1a5692a51f610f903ea76f93bfe4d3221` (implementation
+`aad86e6`). Anvil **vcache 1.6** contains fedora44, el10, ubuntu24, amzn2023 and
+dc-build. The host, EL10 and dc-build `dist/` binary/tracer pairs match those
+published artifacts byte-for-byte, with the merged revision in each stamp.
+
+The release gate passed 1,564 unit, 1,342 integration, 93 link-verification and
+93 publisher checks, plus the ancillary suites. Final EL10 fault and process-tree
+checks also passed. Installed-pair checks in each of host, EL10 and dc-build
+verify compile/link record and hit, changed and newly present inputs, and every
+expected threaded/fork/exec dependency. EL10 additionally passes Cargo 1.97.1
+loading and a real threaded `lld` record/hit. Every target exports all 33 prior
+tracer hooks plus `fork`, including the build against glibc 2.17 headers; no test
+hook is exported.
+
+All five x86-64 Linux targets pass startup and tracer loading in their own OS
+environment. Linux aarch64 and macOS were not executed in this session.
+Evidence: `gate-release.log`, `publish.log`, `installed.log` (host), and
+`installed-clean-launch.log` (EL10, dc-build and export comparison), under the
+scratch directory above.
+Link-verification soak remains configured as `vcache_link=verify`.
