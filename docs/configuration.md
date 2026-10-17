@@ -618,7 +618,10 @@ versions read only the leading counters, and drop the reason lines when they
 next update the file. Memoised compiler fingerprints live in `<dir>/compilers/`,
 and the digests of rustc `--extern` files and of the files C/C++ manifest
 states list, keyed by device, inode, size, mtime and ctime, in
-`<dir>/filehash/`; `vcache --trim` removes those not rewritten for 30 days, and
+`<dir>/filehash/`. Supported local Linux filesystems use a bounded 3 MiB shared
+digest table there; other platforms and table failures retain individual memo
+files. See [the table protocol](file-digest-table.md) for publication, recovery
+and storage limits. `vcache --trim` removes memos not rewritten for 30 days, and
 `vcache --clear` removes them all. They are written without `fsync`: a memo
 lost in a crash costs one re-hash.
 
