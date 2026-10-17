@@ -646,6 +646,17 @@ void TestDepFile() {
           "re-escapes spaces on render");
   }
 
+  const std::string colon_text = "out\\:name.o: source\\:name.c\n\nsource\\:name.c:\n";
+  const auto colon = core::ParseDepFile(colon_text);
+  const auto colon_again = colon ? core::ParseDepFile(core::RenderDepFile(*colon))
+                                 : std::nullopt;
+  Check(colon_again && colon_again->rules.size() == 2 &&
+            colon_again->rules[0].targets == std::vector<std::string>{"out:name.o"} &&
+            colon_again->rules[0].prerequisites == std::vector<std::string>{"source:name.c"} &&
+            colon_again->rules[1].targets == std::vector<std::string>{"source:name.c"} &&
+            colon_again->rules[1].prerequisites.empty(),
+        "escaped colons survive target, prerequisite and phony-rule rendering");
+
   // Rendering must not wrap. cargo reads dep-info a line at a time and treats a
   // token-final backslash as an escaped space in a filename, so a continuation
   // aborts the build with "malformed dep-info format, trailing \".

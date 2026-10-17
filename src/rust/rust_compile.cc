@@ -74,8 +74,8 @@ using core::RootMap;
 // Both bump together. A hit usually follows a manifest state to its entry key
 // without recomputing it, so an entry key bump alone would still lead an older
 // vcache from a v1 manifest into an entry whose sidecar section it skips.
-constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v5";
-constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v3";
+constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v6";
+constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v4";
 
 // Measured on a large Rust workspace's dev build: thresholds of 1, 2 and 4 MiB
 // gave the same warm build, 8 MiB and above a slower one, and the trimmer's
