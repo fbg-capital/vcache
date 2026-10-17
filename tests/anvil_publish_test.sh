@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016 # the generated Makefiles and wrappers keep their $ for make and bash
 # scripts/anvil-publish.sh against stub anvil, podman, git and build-limited, building a small stand-in for vcache
-# from a local origin: one whole publish with --commit, the layout, the archive rather than the working tree, a fedora44
-# build that sees none of the caller's environment, the build record, refusals (a C++ runtime linked dynamically in
-# either target, an unmerged commit, a commit without anvil.toml, a failed el10 build, an el10 binary that does not run
-# in the image, an image pin that matches neither digest), the outbox exit, and a dry run that runs nothing.
+# from a local origin: one whole publish of all five targets with --commit, the layout, the archive rather than the
+# working tree, a fedora44 build that sees none of the caller's environment, each container target built and checked in
+# its own image, the build record, refusals (a C++ runtime linked dynamically in any target, a target linked against
+# another OS's glibc, an unmerged commit, a commit without anvil.toml, a failed el10 build, an el10 binary that does not
+# run in the image, an image pin that matches neither digest), the outbox exit, a dry run that runs nothing, and that
+# the repository's anvil.toml lists the targets the script builds.
 set -uo pipefail
 
 if [[ $(uname -s) != Linux ]]; then
@@ -27,29 +29,52 @@ check() { if [[ $2 == "$3" ]]; then ok "$1"; else bad "$1 (expected '$3', got '$
 has() { if grep -q -- "$3" <<<"$2"; then ok "$1"; else bad "$1 (no '$3' in: $2)"; fi; }
 hasNot() { if grep -q -- "$3" <<<"$2"; then bad "$1 ('$3' in: $2)"; else ok "$1"; fi; }
 
-# ---- toolchain trees: gcc-N wrappers that mark what they built ------------------------------------------------------
+# ---- toolchains: gcc wrappers that mark what they built -------------------------------------------------------------
+
+# writeCompilers <dir> <tag> <c name> <c++ name> <hook>: compilers that build with the real ones and mark the binary
+# with <tag>. `-dM -E` names the glibc of the image the stub podman ran them in (STUB_IMAGE_GLIBC), else this host's,
+# which is fedora44's, as the real compilers name the glibc they link against.
+writeCompilers() {
+  local dir=$1 tag=$2 cc=$3 cxx=$4 hook=$5
+  printf '#!/usr/bin/env bash
+[[ " $* " != *" --version "* ]] || { echo "%s (stub %s) 16.0"; exit 0; }
+if [[ " $* " == *" -dM "* ]]; then
+  cat >/dev/null
+  glibc=${STUB_IMAGE_GLIBC:-2.43}
+  printf "#define __GLIBC__ %%s\\n#define __GLIBC_MINOR__ %%s\\n" "${glibc%%%%.*}" "${glibc#*.}"
+  exit 0
+fi
+%s
+exec %s -DTOOLCHAIN=\\"%s\\" "$@"
+' "$cc" "$tag" "$hook" "$REAL_GCC" "$tag" >"$dir/$cc"
+  printf '#!/usr/bin/env bash\nexec %s -DTOOLCHAIN=\\"%s\\" "$@"\n' "$REAL_GXX" "$tag" >"$dir/$cxx"
+  chmod +x "$dir/$cc" "$dir/$cxx"
+}
 
 # The fedora44 gcc-16 logs the environment it ran in to fedora44-build-env.log; the el10 one fails while STUB_EL10_FAIL
 # is set (the stub podman passes the caller's environment through).
 makeTree() {
-  local tag=$1 tree=$WORK/infra.$1 hook
+  local tag=$1 tree=$WORK/infra.$1 hook=
   mkdir -p "$tree/bin" "$tree/.build-inputs"
   printf '%s\n' "$tag" >"$tree/.infra-os"
   printf 'abc123  -\n' >"$tree/.build-inputs/gcc.sha256"
   if [[ $tag == fedora44 ]]; then
     hook="printf '%s PATH=%s\\n' \"\${STUB_LEAK-unset}\" \"\$PATH\" >>$WORK/fedora44-build-env.log"
-  else
+  elif [[ $tag == el10 ]]; then
     hook='[[ -z ${STUB_EL10_FAIL:-} ]] || { echo "stub el10 gcc fails" >&2; exit 1; }'
   fi
-  printf '#!/usr/bin/env bash\n[[ ${1:-} != --version ]] || { echo "gcc-16 (stub %s) 16.0"; exit 0; }\n%s\nexec %s -DTOOLCHAIN=\\"%s\\" "$@"\n' \
-    "$tag" "$hook" "$REAL_GCC" "$tag" >"$tree/bin/gcc-16"
-  printf '#!/usr/bin/env bash\nexec %s -DTOOLCHAIN=\\"%s\\" "$@"\n' "$REAL_GXX" "$tag" >"$tree/bin/g++-16"
+  writeCompilers "$tree/bin" "$tag" gcc-16 g++-16 "$hook"
   # Older than gcc-16, though it sorts after it as text.
   printf '#!/usr/bin/env bash\necho "gcc-9 is not the newest gcc" >&2\nexit 99\n' >"$tree/bin/gcc-9"
   chmod +x "$tree"/bin/*
 }
-makeTree fedora44
-makeTree el10
+for tag in fedora44 el10 ubuntu24 amzn2023; do
+  makeTree "$tag"
+done
+# dc-build's devtoolset-11: the stub podman runs this enable script in place of the image's.
+mkdir -p "$WORK/devtoolset/bin"
+writeCompilers "$WORK/devtoolset/bin" dc-build gcc g++ ''
+printf 'export PATH=%s:$PATH\n' "$WORK/devtoolset/bin" >"$WORK/devtoolset/enable"
 printf 'ID=fedora\nVERSION_ID=44\n' >"$WORK/os-release"
 
 # ---- stubs -----------------------------------------------------------------------------------------------------------
@@ -63,16 +88,20 @@ exec $REAL_GIT "\$@"
 EOF
 cat >"$STUBS/build-limited" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >>"$STUB_LOG/build-limited"
+# One line per call: the build scripts hold newlines.
+printf '%s\n' "${*//$'\n'/ }" >>"$STUB_LOG/build-limited"
 export HS_BUILD_SLICE=stub.slice
 exec "$@"
 EOF
-# Runs the container's command on this host, with each mount's container path mapped back to its host path.
+# Runs the container's command on this host, with each mount's container path mapped back to its host path, the image's
+# glibc in STUB_IMAGE_GLIBC for the stub compilers, and the stub devtoolset in place of the dc image's. An image's id
+# is stubid-<its name>.
 cat >"$STUBS/podman" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >>"$STUB_LOG/podman"
+printf '%s\n' "${*//$'\n'/ }" >>"$STUB_LOG/podman"
 if [[ $1 == image && $2 == inspect ]]; then
-  echo "stubimageid sha256:stubdigest localhost/sun_container@sha256:repodigest "
+  name=${*: -1}
+  printf 'stubid-%s sha256:stubdigest localhost/sun_container@sha256:repodigest \n' "${name//[^a-zA-Z0-9]/-}"
   exit 0
 fi
 [[ $1 == run ]] || { echo "stub podman: unexpected $1" >&2; exit 99; }
@@ -89,8 +118,15 @@ while (($#)); do
     *) break ;;
   esac
 done
-[[ $1 == stubimageid ]] || { echo "stub podman: ran $1, not the inspected image id" >&2; exit 98; }
+case $1 in
+  stubid-*sun-container*) export STUB_IMAGE_GLIBC=2.39 ;;
+  stubid-*ubuntu2404) export STUB_IMAGE_GLIBC=2.39 ;;
+  stubid-*al2023) export STUB_IMAGE_GLIBC=2.34 ;;
+  stubid-*dc-build) export STUB_IMAGE_GLIBC=2.17 ;;
+  *) echo "stub podman: ran $1, not an inspected image id" >&2; exit 98 ;;
+esac
 shift
+set -- "${@//\/opt\/rh\/devtoolset-11\/enable/$STUB_DEVTOOLSET_ENABLE}"
 if [[ -n ${STUB_PODMAN_FAIL_VERSION:-} && ${*: -1} == --version ]]; then
   echo "stub podman: $1 cannot run in this image" >&2
   exit 126
@@ -166,7 +202,9 @@ writeSource() {
       >"$dir/Makefile"
   fi
 }
-anvilToml() { printf '[artifact.vcache]\nmajor = %s\nos = ["fedora44", "el10"]\n' "$1"; }
+anvilToml() {
+  printf '[artifact.vcache]\nmajor = %s\nos = ["fedora44", "el10", "ubuntu24", "amzn2023", "dc-build"]\n' "$1"
+}
 
 "$REAL_GIT" init -q --bare "$WORK/origin.git"
 "$REAL_GIT" init -q -b fbg "$WORK/seed"
@@ -210,8 +248,10 @@ runPublish() {
   mkdir -p "$WORK/logs/$name"
   touch "$WORK/logs/$name"/{anvil,podman,git,build-limited}
   STUB_LOG=$WORK/logs/$name PATH="$STUBS:$PATH" VCACHE_BUILD_LIMITED=$STUBS/build-limited \
-    VCACHE_FEDORA44_INFRA=$WORK/infra.fedora44 VCACHE_EL10_INFRA=$WORK/infra.el10 VCACHE_OS_RELEASE=$WORK/os-release \
-    VCACHE_PUBLISH_ROOT=$WORK/builds "$WORK/repo/scripts/anvil-publish.sh" "$@" >"$WORK/$name.out" 2>&1
+    STUB_DEVTOOLSET_ENABLE=$WORK/devtoolset/enable VCACHE_FEDORA44_INFRA=$WORK/infra.fedora44 \
+    VCACHE_EL10_INFRA=$WORK/infra.el10 VCACHE_UBUNTU24_INFRA=$WORK/infra.ubuntu24 \
+    VCACHE_AMZN2023_INFRA=$WORK/infra.amzn2023 VCACHE_OS_RELEASE=$WORK/os-release VCACHE_PUBLISH_ROOT=$WORK/builds \
+    "$WORK/repo/scripts/anvil-publish.sh" "$@" >"$WORK/$name.out" 2>&1
 }
 log() { cat "$WORK/logs/$1/$2"; }
 workDirs() { find "$WORK/builds" -mindepth 1 -maxdepth 1 -name 'anvil-publish-*' 2>/dev/null | wc -l; }
@@ -223,28 +263,49 @@ check "one anvil call" "$(log tip anvil | wc -l)" 1
 check "a whole publish of origin's fbg tip, by full commit" "$(log tip anvil | sed 's/--dir [^ ]*/--dir D/')" \
   "publish vcache --dir D --commit $C3 --color never"
 snapshot=$WORK/logs/tip/publish-1
-check "the publish directory holds both targets and anvil.toml" \
-  "$(cd "$snapshot" && find . -type f -printf '%P %m\n' | sort | paste -sd,)" \
-  "anvil.toml 644,el10/vcache 555,el10/vcache-fstrace.so 555,fedora44/vcache 555,fedora44/vcache-fstrace.so 555"
+check "the publish directory holds all five targets and anvil.toml" \
+  "$(cd "$snapshot" && find . -type f -printf '%P %m\n' | LC_ALL=C sort | paste -sd,)" \
+  "amzn2023/vcache 555,amzn2023/vcache-fstrace.so 555,anvil.toml 644,dc-build/vcache 555,dc-build/vcache-fstrace.so 555,el10/vcache 555,el10/vcache-fstrace.so 555,fedora44/vcache 555,fedora44/vcache-fstrace.so 555,ubuntu24/vcache 555,ubuntu24/vcache-fstrace.so 555"
 check "fedora44 is the archive's c3, built with the fedora44 tree's newest gcc" \
   "$("$snapshot/fedora44/vcache" --version)" "vcache 9.9.9 c3 fedora44"
-check "el10 is the archive's c3, built in the image with the el10 tree" \
-  "$("$snapshot/el10/vcache" --version)" "vcache 9.9.9 c3 el10"
+for tag in el10 ubuntu24 amzn2023; do
+  check "$tag is the archive's c3, built in its image with the $tag tree" \
+    "$("$snapshot/$tag/vcache" --version)" "vcache 9.9.9 c3 $tag"
+done
+check "dc-build is the archive's c3, built in its image with devtoolset-11" \
+  "$("$snapshot/dc-build/vcache" --version)" "vcache 9.9.9 c3 dc-build"
 check "anvil.toml is the commit's, not the working tree's" "$(cat "$snapshot/anvil.toml")" "$(anvilToml 1)"
 check "anvil runs outside the checkout" "$("$REAL_GIT" -C "$(cat "$snapshot.cwd")" rev-parse 2>/dev/null && echo git)" ""
-has "the el10 build joins build-limited's slice" "$(log tip podman | grep -- ' -w ')" '--cgroup-parent=stub.slice'
-has "the el10 build mounts the el10 tree at /opt/infra" "$(log tip podman | grep -- ' -w ')" \
-  "-v $WORK/infra.el10:/opt/infra:ro"
-check "both builds go through build-limited" "$(log tip build-limited | wc -l)" 2
+builds=$(log tip podman | grep -- 'fetch\.sh')
+check "four container builds" "$(wc -l <<<"$builds")" 4
+check "each container build joins build-limited's slice" "$(grep -c -- '--cgroup-parent=stub.slice' <<<"$builds")" 4
+has "el10 builds in its image with the el10 tree at /opt/infra" "$builds" \
+  "-v $WORK/infra.el10:/opt/infra:ro .* stubid-sun-container-el10 bash"
+has "ubuntu24 builds in its image with the ubuntu24 tree at /opt/infra" "$builds" \
+  "-v $WORK/infra.ubuntu24:/opt/infra:ro .* stubid-localhost-fbg-dev-ubuntu2404 bash"
+has "amzn2023 builds in its image with the amzn2023 tree at /opt/infra" "$builds" \
+  "-v $WORK/infra.amzn2023:/opt/infra:ro .* stubid-localhost-fbg-dev-al2023 bash"
+has "dc-build builds in its image with devtoolset-11 and no tree" "$builds" \
+  "/dc-build -e HOME=/tmp .* stubid-localhost-dc-build bash -c set -e; source /opt/rh/devtoolset-11/enable;"
+check "all five builds go through build-limited" "$(log tip build-limited | wc -l)" 5
 has "el10 is checked in the image with its tree and no library path" "$(log tip podman)" \
-  "run --rm -v [^ ]*/out/el10:/v:ro -v $WORK/infra.el10:/opt/infra:ro stubimageid /v/vcache --version"
-check "git archives c3 once per target" "$(log tip git | grep -c " archive $C3$")" 2
+  "run --rm -v [^ ]*/out/el10:/v:ro -v $WORK/infra.el10:/opt/infra:ro stubid-sun-container-el10 /v/vcache --version"
+for spec in ubuntu24:localhost-fbg-dev-ubuntu2404 amzn2023:localhost-fbg-dev-al2023 dc-build:localhost-dc-build; do
+  has "${spec%%:*} is checked in its image, with no tree" "$(log tip podman)" \
+    "run --rm -v [^ ]*/out/${spec%%:*}:/v:ro stubid-${spec#*:} /v/vcache --version"
+done
+check "git archives c3 once per target" "$(log tip git | grep -c " archive $C3$")" 5
 hasNot "git never touches the working tree" "$(log tip git)" ' \(checkout\|switch\|stash\|reset\|restore\|clean\|worktree\)\( \|$\)'
-has "the build record names the image digest" "$(cat "$WORK/tip.out")" 'digest sha256:stubdigest, id stubimageid'
-has "the build record names fedora44's binutils, cmake and glibc" "$(cat "$WORK/tip.out")" \
-  '^  fedora44  ld: .*; as: .*; cmake: .*; glibc [0-9]'
-has "the build record names el10's binutils, cmake and glibc" "$(cat "$WORK/tip.out")" \
-  '^  el10      ld: .*; as: .*; cmake: .*; glibc [0-9]'
+has "the build record names the image digest" "$(cat "$WORK/tip.out")" \
+  'el10      sun_container:el10 = digest sha256:stubdigest, id stubid-sun-container-el10'
+for tag in fedora44 el10 ubuntu24 amzn2023 dc-build; do
+  has "the build record names $tag's compiler, binutils, cmake and glibc" "$(cat "$WORK/tip.out")" \
+    "^  $tag *cc: .*; ld: .*; as: .*; cmake: .*; glibc [0-9]"
+done
+for spec in fedora44:2.43 el10:2.39 ubuntu24:2.39 amzn2023:2.34 dc-build:2.17; do
+  has "the build record names the glibc ${spec%%:*} linked against and the versions it needs" "$(cat "$WORK/tip.out")" \
+    "^  ${spec%%:*} *linked against glibc ${spec#*:}; needs GLIBC_[0-9.]* (vcache), GLIBC_[0-9.]* (vcache-fstrace.so)$"
+done
 check "the fedora44 build sees none of the caller's environment and a fixed PATH" \
   "$(sort -u "$WORK/fedora44-build-env.log")" "unset PATH=/usr/bin:/bin"
 check "the work directory is removed" "$(workDirs)" 0
@@ -253,6 +314,13 @@ echo 'anvil-publish: --dry-run'
 runPublish dry --dry-run
 check "exits 0" "$?" 0
 has "prints the publish" "$(cat "$WORK/dry.out")" "anvil publish vcache --dir .* --commit $C3"
+check "lists five builds" "$(grep '^\[anvil-publish\] build [a-z0-9-]* \(natively\|in\) ' "$WORK/dry.out" |
+  sed 's/ with .*//')" \
+  "[anvil-publish] build fedora44 natively
+[anvil-publish] build el10 in sun_container:el10
+[anvil-publish] build ubuntu24 in localhost/fbg-dev:ubuntu2404
+[anvil-publish] build amzn2023 in localhost/fbg-dev:al2023
+[anvil-publish] build dc-build in localhost/dc:build"
 check "calls no anvil" "$(log dry anvil | wc -l)" 0
 check "runs no container" "$(log dry podman | grep -c '^run')" 0
 check "builds nothing" "$(log dry build-limited | wc -l)" 0
@@ -309,6 +377,25 @@ echo 'anvil-publish: the server is unreachable'
 STUB_ANVIL_EXIT=8 runPublish outbox
 check "exits 8" "$?" 8
 has "says the publish is queued" "$(cat "$WORK/outbox.out")" 'queued the publish in its outbox'
+
+echo 'anvil-publish: a target built in another OS image'
+for spec in AMZN2023:localhost/fbg-dev:ubuntu2404:amzn2023:2.39:2.34 UBUNTU24:localhost/fbg-dev:al2023:ubuntu24:2.34:2.39 \
+  DC_BUILD:sun_container:el10:dc-build:2.39:2.17; do
+  IFS=: read -r name image_name image_tag tag built shipped <<<"$spec"
+  (
+    export "VCACHE_${name}_IMAGE=$image_name:$image_tag"
+    runPublish "wrong-$tag"
+  )
+  check "$tag built in $image_name:$image_tag exits 1" "$?" 1
+  has "$tag built in $image_name:$image_tag: names the glibc it linked against" "$(cat "$WORK/wrong-$tag.out")" \
+    "$tag was linked against glibc $built, but $tag ships glibc $shipped"
+  check "$tag built in $image_name:$image_tag: publishes nothing" "$(log "wrong-$tag" anvil | wc -l)" 0
+done
+
+echo "anvil-publish: the repository's anvil.toml"
+check "lists the targets the script builds, in its order" \
+  "$(sed -n 's/^os = \[\(.*\)\]$/\1/p' "$TOP/anvil.toml" | tr ',' '\n' | tr -d '" ')" \
+  "$(grep -o 'targets [a-z0-9 -]* (dry run' "$WORK/dry.out" | sed 's/^targets //; s/ (dry run$//' | tr ' ' '\n')"
 
 printf 'anvil-publish: %s passed, %s failed\n' "$PASS" "$FAIL"
 ((FAIL == 0))
