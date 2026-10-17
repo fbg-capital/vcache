@@ -4820,7 +4820,8 @@ int main(void) {
   return 0;
 }
 EOF
-gcc -std=c11 -O2 -fPIC -shared -Wall -Wextra -include "$WORK/tracer-nonnull/nonnull.h" \
+gcc -std=c11 -O2 -fPIC -shared -pthread -Wall -Wextra -Wl,-z,defs \
+  -include "$WORK/tracer-nonnull/nonnull.h" \
   -o "$WORK/tracer-nonnull/fstrace-nonnull.so" "$TOP/src/trace/fstrace.c" -ldl
 gcc "$WORK/tracer-nonnull/probe.c" -o "$WORK/tracer-nonnull/probe"
 ( cd "$WORK/tracer-nonnull" && VCACHE_TRACE_LOG="$WORK/tracer-nonnull/trace" \

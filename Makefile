@@ -294,7 +294,8 @@ MAIN_SRC := $(SRC)/main.cc
 
 # The link tracer is LD_PRELOADed into the linker's whole process tree, so it
 # is a standalone shared object rather than part of the binary. It links
-# against libdl only; anything more would be visible to every traced process.
+# against libdl and libpthread so its loader and fork hooks resolve even in
+# single-threaded processes on older glibc.
 #
 # Linux only: it reads /proc/self/exe and /proc/self/fd and walks the loaded
 # objects with dl_iterate_phdr, none of which exist on macOS. Building it
@@ -329,9 +330,9 @@ DEPS     := $(ALL_OBJS:.o=.d)
 all: $(BINDIR)/vcache $(TRACER_SO)
 
 ifeq ($(HOST_OS),Linux)
-$(TRACER_SO): $(TRACER_SRC)
+$(TRACER_SO): $(TRACER_SRC) $(TOP)/Makefile
 	@mkdir -p $(BINDIR)
-	$(CC) -std=c11 -O2 -fPIC -shared -Wall -Wextra -o $@ $< -ldl
+	$(CC) -std=c11 -O2 -fPIC -shared -pthread -Wall -Wextra -Wl,-z,defs -o $@ $< -ldl
 endif
 
 deps:
