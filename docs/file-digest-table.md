@@ -147,3 +147,20 @@ the ancillary suites (`gate-integrated.log`). A separate binary/tracer regressio
 fails table creation on the old binary and passes on the combined development
 build, including restored-mtime edits, file replacement, unsettled writes,
 corrupt digests and truncation between processes.
+
+## Deployment
+
+Anvil artifact `vcache 1.5` publishes revision
+`d460a2e147d9f20beabd6590c4b622ef957dcebe` for fedora44, el10, ubuntu24, amzn2023
+and dc-build. The host, EL10 and dc-build `dist/` installations match those
+published binaries and tracers byte for byte. Each installed pair passed the
+real compiler regression described above in its own environment.
+
+The first publication attempt caught an independent issue in the newly merged
+fork hooks: the tracer needed libpthread for `pthread_atfork` on glibc 2.17.
+The corrected link adds `-pthread` and rejects unresolved symbols. The real
+dc-build loader check now passes, and omitting the library fails the link gate.
+The full host gate also passed again after this fix. Evidence is retained in
+`tracer-dc-check.log`, `gate-tracer-link.log`, `publish-final.log`,
+`deploy-final.log` and `installed-final-{host,el10,dc-build}.log` under the
+scratch directory above. Link-verification soak settings were preserved.
