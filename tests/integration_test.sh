@@ -4123,8 +4123,9 @@ check "and no marker is made under a shortened name" \
 # not cost the trace its records: the log is already past that size. The
 # tracer's appends go out above the program's soft limit, and the program still
 # sees its limit, its own EFBIG, and no SIGXFSZ from a write it did not make.
-# With the hard limit lowered too, nothing can lift it: the records are lost,
-# loudly, and the program is still not killed for them.
+# A hard limit with room is lifted to and put back the same way. With the hard
+# limit below the log, nothing can lift it: the records are lost, loudly, and
+# the program is still not killed for them.
 mkdir -p "$WORK/tracer-fsize"
 printf 'input\n' > "$WORK/tracer-fsize/input"
 cat > "$WORK/tracer-fsize/fsize.c" <<'EOF'
@@ -4140,7 +4141,9 @@ int main(int argc, char **argv) {
   if (owns_writes) signal(SIGXFSZ, SIG_IGN);
   struct rlimit before;
   if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
-  struct rlimit tiny = {8, strcmp(mode, "hard") == 0 ? 8 : before.rlim_max};
+  struct rlimit tiny = {8, before.rlim_max};
+  if (strcmp(mode, "hard") == 0) tiny.rlim_max = 8;
+  if (strcmp(mode, "roomy") == 0) tiny.rlim_max = 1 << 20;
   if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
   if (owns_writes) {
     int out = open("out", O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -4164,31 +4167,114 @@ int main(int argc, char **argv) {
 EOF
 gcc "$WORK/tracer-fsize/fsize.c" -o "$WORK/tracer-fsize/fsize"
 fsize_traced() {
-  rm -f "$WORK/tracer-fsize/$1.trace" "$WORK/tracer-fsize/$1.trace.incomplete"
-  ( cd "$WORK/tracer-fsize" && VCACHE_TRACE_LOG="$WORK/tracer-fsize/$1.trace" \
-    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./fsize "$1" )
+  local program="$1" mode="$2"
+  rm -f "$WORK/tracer-fsize/$mode.trace" "$WORK/tracer-fsize/$mode.trace.incomplete"
+  ( cd "$WORK/tracer-fsize" && VCACHE_TRACE_LOG="$WORK/tracer-fsize/$mode.trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" "./$program" "$mode" )
 }
-fsize_traced ignored
+fsize_trace_state() {
+  [[ -e "$WORK/tracer-fsize/$1.trace.incomplete" ]] ||
+    grep -qx '!' "$WORK/tracer-fsize/$1.trace" && echo lost || echo fine
+}
+fsize_records() {
+  grep -cxF -e $'R\t'"$WORK/tracer-fsize/input" -e $'M\t'"$WORK/tracer-fsize/absent" \
+    "$WORK/tracer-fsize/$1.trace"
+}
+fsize_traced fsize ignored
 check "a program's own small RLIMIT_FSIZE keeps its EFBIG and its limit under the tracer" "$?" "0"
-check "and its trace is complete" \
-  "$([[ -e "$WORK/tracer-fsize/ignored.trace.incomplete" ]] ||
-     grep -qx '!' "$WORK/tracer-fsize/ignored.trace" && echo lost || echo fine)" "fine"
-check "and records what it read and probed past the limit" \
-  "$(grep -cxF -e $'R\t'"$WORK/tracer-fsize/input" -e $'M\t'"$WORK/tracer-fsize/absent" \
-      "$WORK/tracer-fsize/ignored.trace")" "2"
+check "and its trace is complete" "$(fsize_trace_state ignored)" "fine"
+check "and records what it read and probed past the limit" "$(fsize_records ignored)" "2"
 check "and its own write still stops at its limit" \
   "$(wc -c < "$WORK/tracer-fsize/out")" "8"
-fsize_traced default
+fsize_traced fsize default
 check "a program that leaves SIGXFSZ at its default is not killed by the tracer's writes" "$?" "0"
-check "and its trace is complete" \
-  "$([[ -e "$WORK/tracer-fsize/default.trace.incomplete" ]] && echo lost || echo fine)" "fine"
-check "and holds its records" \
-  "$(grep -cxF -e $'R\t'"$WORK/tracer-fsize/input" -e $'M\t'"$WORK/tracer-fsize/absent" \
-      "$WORK/tracer-fsize/default.trace")" "2"
-fsize_traced hard
+check "and its trace is complete" "$(fsize_trace_state default)" "fine"
+check "and holds its records" "$(fsize_records default)" "2"
+fsize_traced fsize roomy
+check "a finite hard RLIMIT_FSIZE with room is lifted to and put back" "$?" "0"
+check "and the trace is complete" "$(fsize_trace_state roomy)" "fine"
+check "and holds its records" "$(fsize_records roomy)" "2"
+fsize_traced fsize hard
 check "a hard RLIMIT_FSIZE below the log does not get the program killed either" "$?" "0"
-check "and the trace is marked incomplete" \
-  "$([[ -e "$WORK/tracer-fsize/hard.trace.incomplete" ]] && echo lost || echo fine)" "lost"
+check "and the trace is marked incomplete" "$(fsize_trace_state hard)" "lost"
+
+# The limit is process-wide, so the lift is serialised across threads, a
+# handler that records between two of them, and children forked meanwhile.
+cat > "$WORK/tracer-fsize/threads.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+enum { kThreads = 4, kOpens = 1000, kForksPerThread = 5 };
+static volatile sig_atomic_t handler_opens;
+static void on_alarm(int sig) {
+  (void)sig;
+  int saved = errno;
+  int fd = open("absent-handler", O_RDONLY);
+  if (fd >= 0) close(fd);
+  ++handler_opens;
+  errno = saved;
+}
+static void *open_absent(void *arg) {
+  (void)arg;
+  for (int i = 0; i < kOpens; ++i) {
+    int fd = open("absent-thread", O_RDONLY);
+    if (fd >= 0) close(fd);
+    if (i % (kOpens / kForksPerThread) == 0 && fork() == 0) {
+      fd = open("absent-child", O_RDONLY);
+      _exit(fd >= 0);
+    }
+  }
+  return NULL;
+}
+int main(void) {
+  struct rlimit before;
+  if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
+  struct rlimit tiny = {8, before.rlim_max};
+  if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
+  struct sigaction on_timer;
+  memset(&on_timer, 0, sizeof on_timer);
+  on_timer.sa_handler = on_alarm;
+  on_timer.sa_flags = SA_RESTART;
+  if (sigaction(SIGALRM, &on_timer, NULL) != 0) return 12;
+  struct itimerval every = {{0, 200}, {0, 200}};
+  if (setitimer(ITIMER_REAL, &every, NULL) != 0) return 13;
+  pthread_t threads[kThreads];
+  for (int i = 0; i < kThreads; ++i) pthread_create(&threads[i], NULL, open_absent, NULL);
+  for (int i = 0; i < kThreads; ++i) pthread_join(threads[i], NULL);
+  struct itimerval off;
+  memset(&off, 0, sizeof off);
+  setitimer(ITIMER_REAL, &off, NULL);
+  for (;;) {
+    int status;
+    if (wait(&status) >= 0) {
+      if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 14;
+    } else if (errno != EINTR) {
+      break;
+    }
+  }
+  struct rlimit after;
+  if (getrlimit(RLIMIT_FSIZE, &after) != 0) return 15;
+  if (after.rlim_cur != tiny.rlim_cur || after.rlim_max != tiny.rlim_max) return 16;
+  printf("%d\n", (int)handler_opens);
+  return handler_opens > 0 ? 0 : 17;
+}
+EOF
+gcc -pthread "$WORK/tracer-fsize/threads.c" -o "$WORK/tracer-fsize/threads"
+fsize_handler_opens="$(fsize_traced threads threads)"
+check "threads, a recording handler and forks keep a small RLIMIT_FSIZE intact" "$?" "0"
+check "and the trace is complete" "$(fsize_trace_state threads)" "fine"
+check "and holds every thread's, child's and handler's record" \
+  "$(grep -c $'^M\t.*/absent-thread$' "$WORK/tracer-fsize/threads.trace")/$(
+     grep -c $'^M\t.*/absent-child$' "$WORK/tracer-fsize/threads.trace")/$(
+     grep -c $'^M\t.*/absent-handler$' "$WORK/tracer-fsize/threads.trace")" \
+  "4000/20/$fsize_handler_opens"
 
 if [[ "$(id -u)" != 0 ]]; then
   mkdir -p "$WORK/tracer-sealed"
