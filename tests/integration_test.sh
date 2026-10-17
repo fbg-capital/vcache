@@ -4119,6 +4119,411 @@ check "a marker whose name does not fit is a lost-record line in the log" \
 check "and no marker is made under a shortened name" \
   "$(ls "$(dirname "$long_log")" | grep -c '\.incomplete$')" "0"
 
+# A program that lowers RLIMIT_FSIZE to inject write failures of its own must
+# not cost the trace its records: the log is already past that size. The
+# tracer's appends go out above the program's soft limit, and the program still
+# sees its limit, its own EFBIG, and no SIGXFSZ from a write it did not make.
+# A hard limit with room is lifted to and put back the same way. With the hard
+# limit below the log, nothing can lift it: the records are lost, loudly, and
+# the program is still not killed for them.
+mkdir -p "$WORK/tracer-fsize"
+printf 'input\n' > "$WORK/tracer-fsize/input"
+cat > "$WORK/tracer-fsize/fsize.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  const char *mode = argc > 1 ? argv[1] : "";
+  int owns_writes = strcmp(mode, "ignored") == 0;
+  if (owns_writes) signal(SIGXFSZ, SIG_IGN);
+  struct rlimit before;
+  if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
+  struct rlimit tiny = {8, before.rlim_max};
+  if (strcmp(mode, "hard") == 0) tiny.rlim_max = 8;
+  if (strcmp(mode, "roomy") == 0) tiny.rlim_max = 1 << 20;
+  if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
+  if (owns_writes) {
+    int out = open("out", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (out < 0) return 12;
+    char data[64];
+    memset(data, 'x', sizeof data);
+    if (write(out, data, sizeof data) != 8) return 13;
+    if (write(out, data, 1) != -1 || errno != EFBIG) return 14;
+    close(out);
+  }
+  int input = open("input", O_RDONLY);
+  if (input < 0) return 15;
+  close(input);
+  int absent = open("absent", O_RDONLY);
+  if (absent >= 0 || errno != ENOENT) return 16;
+  struct rlimit after;
+  if (getrlimit(RLIMIT_FSIZE, &after) != 0) return 17;
+  if (after.rlim_cur != tiny.rlim_cur || after.rlim_max != tiny.rlim_max) return 18;
+  return 0;
+}
+EOF
+gcc "$WORK/tracer-fsize/fsize.c" -o "$WORK/tracer-fsize/fsize"
+fsize_traced() {
+  local program="$1" mode="$2"
+  rm -f "$WORK/tracer-fsize/$mode.trace" "$WORK/tracer-fsize/$mode.trace.incomplete"
+  ( cd "$WORK/tracer-fsize" && VCACHE_TRACE_LOG="$WORK/tracer-fsize/$mode.trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" "./$program" "$mode" )
+}
+fsize_trace_state() {
+  [[ -e "$WORK/tracer-fsize/$1.trace.incomplete" ]] ||
+    grep -qx '!' "$WORK/tracer-fsize/$1.trace" && echo lost || echo fine
+}
+fsize_records() {
+  grep -cxF -e $'R\t'"$WORK/tracer-fsize/input" -e $'M\t'"$WORK/tracer-fsize/absent" \
+    "$WORK/tracer-fsize/$1.trace"
+}
+fsize_traced fsize ignored
+check "a program's own small RLIMIT_FSIZE keeps its EFBIG and its limit under the tracer" "$?" "0"
+check "and its trace is complete" "$(fsize_trace_state ignored)" "fine"
+check "and records what it read and probed past the limit" "$(fsize_records ignored)" "2"
+check "and its own write still stops at its limit" \
+  "$(wc -c < "$WORK/tracer-fsize/out")" "8"
+fsize_traced fsize default
+check "a program that leaves SIGXFSZ at its default is not killed by the tracer's writes" "$?" "0"
+check "and its trace is complete" "$(fsize_trace_state default)" "fine"
+check "and holds its records" "$(fsize_records default)" "2"
+fsize_traced fsize roomy
+check "a finite hard RLIMIT_FSIZE with room is lifted to and put back" "$?" "0"
+check "and the trace is complete" "$(fsize_trace_state roomy)" "fine"
+check "and holds its records" "$(fsize_records roomy)" "2"
+fsize_traced fsize hard
+check "a hard RLIMIT_FSIZE below the log does not get the program killed either" "$?" "0"
+check "and the trace is marked incomplete" "$(fsize_trace_state hard)" "lost"
+
+# The limit is process-wide, so the lift is serialised across threads, a
+# handler that records between two of them, and children forked meanwhile.
+cat > "$WORK/tracer-fsize/threads.c" <<'EOF'
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+enum { kThreads = 4, kOpens = 1000, kForksPerThread = 5 };
+static int handler_opens;
+static struct rlimit tiny;
+static int has_tiny_limit(void) {
+  struct rlimit now;
+  return getrlimit(RLIMIT_FSIZE, &now) == 0 && now.rlim_cur == tiny.rlim_cur &&
+         now.rlim_max == tiny.rlim_max;
+}
+static void on_alarm(int sig) {
+  (void)sig;
+  int saved = errno;
+  int fd = open("absent-handler", O_RDONLY);
+  if (fd >= 0) close(fd);
+  __atomic_fetch_add(&handler_opens, 1, __ATOMIC_SEQ_CST);
+  errno = saved;
+}
+static void *open_absent(void *arg) {
+  (void)arg;
+  for (int i = 0; i < kOpens; ++i) {
+    int fd = open("absent-thread", O_RDONLY);
+    if (fd >= 0) close(fd);
+    if (i % (kOpens / kForksPerThread) == 0 && fork() == 0) {
+      fd = open("absent-child", O_RDONLY);
+      _exit(fd >= 0 || !has_tiny_limit());
+    }
+  }
+  return NULL;
+}
+int main(void) {
+  struct rlimit before;
+  if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
+  tiny.rlim_cur = 8;
+  tiny.rlim_max = before.rlim_max;
+  if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
+  struct sigaction on_timer;
+  memset(&on_timer, 0, sizeof on_timer);
+  on_timer.sa_handler = on_alarm;
+  on_timer.sa_flags = SA_RESTART;
+  if (sigaction(SIGALRM, &on_timer, NULL) != 0) return 12;
+  struct itimerval every = {{0, 200}, {0, 200}};
+  if (setitimer(ITIMER_REAL, &every, NULL) != 0) return 13;
+  pthread_t threads[kThreads];
+  for (int i = 0; i < kThreads; ++i) pthread_create(&threads[i], NULL, open_absent, NULL);
+  for (int i = 0; i < kThreads; ++i) pthread_join(threads[i], NULL);
+  struct itimerval off;
+  memset(&off, 0, sizeof off);
+  setitimer(ITIMER_REAL, &off, NULL);
+  sigset_t alarm_only;
+  sigemptyset(&alarm_only);
+  sigaddset(&alarm_only, SIGALRM);
+  sigprocmask(SIG_BLOCK, &alarm_only, NULL);
+  for (;;) {
+    int status;
+    if (wait(&status) >= 0) {
+      if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 14;
+    } else if (errno != EINTR) {
+      break;
+    }
+  }
+  if (!has_tiny_limit()) return 16;
+  int handler_count = __atomic_load_n(&handler_opens, __ATOMIC_SEQ_CST);
+  printf("%d\n", handler_count);
+  return handler_count > 0 ? 0 : 17;
+}
+EOF
+gcc -pthread "$WORK/tracer-fsize/threads.c" -o "$WORK/tracer-fsize/threads"
+fsize_handler_opens="$(fsize_traced threads threads)"
+check "threads, a recording handler and forks keep a small RLIMIT_FSIZE intact" "$?" "0"
+check "and the trace is complete" "$(fsize_trace_state threads)" "fine"
+check "and holds every thread's, child's and handler's record" \
+  "$(grep -c $'^M\t.*/absent-thread$' "$WORK/tracer-fsize/threads.trace")/$(
+     grep -c $'^M\t.*/absent-child$' "$WORK/tracer-fsize/threads.trace")/$(
+     grep -c $'^M\t.*/absent-handler$' "$WORK/tracer-fsize/threads.trace")" \
+  "4000/20/$fsize_handler_opens"
+
+# A child must end up with the program's limit when another thread holds the
+# lifted one as it is made. fork() waits for the window to close; a raw clone
+# child, which gets a copy of the lifted limit, puts it back at its first
+# record. The program's own syscall(), exported ahead of libc's, holds the
+# tracer's write of one record inside the window while a second thread forks:
+# for 20 ms after fork() is called, and until a raw clone has returned. A fork
+# child's copy of memory must show that write finished, and fork() must not
+# have waited out the tracer's 1 s bound instead.
+cat > "$WORK/tracer-fsize/window_fork.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+static long (*next_syscall)(long, ...);
+static int is_in_window, has_called_fork, has_forked, has_written_held, uses_raw_clone;
+static struct rlimit tiny;
+static int has_tiny_limit(void) {
+  struct rlimit now;
+  return getrlimit(RLIMIT_FSIZE, &now) == 0 && now.rlim_cur == tiny.rlim_cur &&
+         now.rlim_max == tiny.rlim_max;
+}
+long syscall(long number, ...) {
+  if (next_syscall == NULL) next_syscall = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+  long args[6];
+  va_list a;
+  va_start(a, number);
+  for (int i = 0; i < 6; ++i) args[i] = va_arg(a, long);
+  va_end(a);
+  if (number == SYS_write && !__atomic_load_n(&is_in_window, __ATOMIC_SEQ_CST) &&
+      memmem((const void *)args[1], (size_t)args[2], "fork-in-window", 14) != NULL) {
+    __atomic_store_n(&is_in_window, 1, __ATOMIC_SEQ_CST);
+    if (uses_raw_clone) {
+      while (!__atomic_load_n(&has_forked, __ATOMIC_SEQ_CST)) next_syscall(SYS_sched_yield);
+    } else {
+      while (!__atomic_load_n(&has_called_fork, __ATOMIC_SEQ_CST)) next_syscall(SYS_sched_yield);
+      const struct timespec hold = {0, 20 * 1000 * 1000};
+      next_syscall(SYS_nanosleep, &hold, NULL);
+    }
+    long held_result = next_syscall(number, args[0], args[1], args[2], args[3], args[4], args[5]);
+    __atomic_store_n(&has_written_held, 1, __ATOMIC_SEQ_CST);
+    return held_result;
+  }
+  return next_syscall(number, args[0], args[1], args[2], args[3], args[4], args[5]);
+}
+static void *fork_in_window(void *arg) {
+  (void)arg;
+  while (!__atomic_load_n(&is_in_window, __ATOMIC_SEQ_CST)) sched_yield();
+  __atomic_store_n(&has_called_fork, 1, __ATOMIC_SEQ_CST);
+  struct timespec fork_start, fork_end;
+  clock_gettime(CLOCK_MONOTONIC, &fork_start);
+  pid_t child = uses_raw_clone ? (pid_t)next_syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0) : fork();
+  if (child == 0) {
+    if (!uses_raw_clone && !has_tiny_limit()) _exit(2);
+    if (!uses_raw_clone && !__atomic_load_n(&has_written_held, __ATOMIC_SEQ_CST)) _exit(5);
+    int fd = open("absent-forked", O_RDONLY);
+    _exit(fd >= 0 ? 3 : has_tiny_limit() ? 0 : 4);
+  }
+  clock_gettime(CLOCK_MONOTONIC, &fork_end);
+  __atomic_store_n(&has_forked, 1, __ATOMIC_SEQ_CST);
+  long long fork_ms = (fork_end.tv_sec - fork_start.tv_sec) * 1000LL +
+                      (fork_end.tv_nsec - fork_start.tv_nsec) / 1000000;
+  int status = -1;
+  if (child > 0) waitpid(child, &status, 0);
+  if (fork_ms >= 500) return (void *)(intptr_t)6;
+  return (void *)(intptr_t)(WIFEXITED(status) ? WEXITSTATUS(status) : 9);
+}
+int main(int argc, char **argv) {
+  uses_raw_clone = argc > 1 && strcmp(argv[1], "raw") == 0;
+  struct rlimit before;
+  if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
+  tiny.rlim_cur = 8;
+  tiny.rlim_max = before.rlim_max;
+  if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
+  pthread_t forker;
+  if (pthread_create(&forker, NULL, fork_in_window, NULL) != 0) return 12;
+  int fd = open("absent-fork-in-window", O_RDONLY);
+  if (fd >= 0) return 13;
+  void *child_exit = NULL;
+  pthread_join(forker, &child_exit);
+  if (!has_tiny_limit()) return 14;
+  return (int)(intptr_t)child_exit;
+}
+EOF
+gcc -pthread -rdynamic "$WORK/tracer-fsize/window_fork.c" -o "$WORK/tracer-fsize/window_fork" -ldl
+for fsize_fork in fork raw; do
+  ( cd "$WORK/tracer-fsize" && timeout -s KILL 20 env VCACHE_TRACE_LOG="$WORK/tracer-fsize/$fsize_fork.trace" \
+    LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./window_fork "$fsize_fork" )
+  check "a $fsize_fork child made inside the window ends up with the program's limit" "$?" "0"
+done
+
+# Atfork handlers registered before the tracer's (here a DT_NEEDED library's)
+# run their prepare step after it, on the forking thread. The tracer must not
+# hold its lock across fork, or their records wait out its bound and are lost.
+cat > "$WORK/tracer-fsize/prepare.c" <<'EOF'
+#include <fcntl.h>
+#include <pthread.h>
+#include <unistd.h>
+static void open_in_prepare(void) {
+  int fd = open("absent-prepare", O_RDONLY);
+  if (fd >= 0) close(fd);
+}
+__attribute__((constructor)) static void register_prepare(void) {
+  pthread_atfork(open_in_prepare, NULL, NULL);
+}
+EOF
+cat > "$WORK/tracer-fsize/prepare_fork.c" <<'EOF'
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+int main(void) {
+  struct rlimit before;
+  if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
+  struct rlimit tiny = {8, before.rlim_max};
+  if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
+  if (open("absent-before-fork", O_RDONLY) >= 0) return 12;
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  pid_t child = fork();
+  if (child == 0) _exit(0);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  if (child < 0) return 13;
+  int status;
+  waitpid(child, &status, 0);
+  long long fork_ms = (end.tv_sec - start.tv_sec) * 1000LL + (end.tv_nsec - start.tv_nsec) / 1000000;
+  printf("%lld\n", fork_ms);
+  return fork_ms < 500 ? 0 : 14;
+}
+EOF
+gcc -fPIC -shared -pthread "$WORK/tracer-fsize/prepare.c" -o "$WORK/tracer-fsize/libprepare.so"
+gcc "$WORK/tracer-fsize/prepare_fork.c" -o "$WORK/tracer-fsize/prepare_fork" \
+  -L"$WORK/tracer-fsize" -Wl,--no-as-needed -lprepare -Wl,-rpath,"$WORK/tracer-fsize"
+( cd "$WORK/tracer-fsize" && VCACHE_TRACE_LOG="$WORK/tracer-fsize/prepare.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./prepare_fork ) >/dev/null
+check "an earlier atfork handler's record inside fork does not wait out the bound" "$?" "0"
+check "and is recorded in a complete trace" \
+  "$(fsize_trace_state prepare)/$(grep -c $'^M\t.*/absent-prepare$' "$WORK/tracer-fsize/prepare.trace")" \
+  "fine/1"
+
+# A window that opens after the tracer's prepare step and before the copy puts
+# the lifted limit into the child, which must get the program's limit back
+# before it runs any code of its own. An earlier-registered prepare handler
+# lets a second thread record, and the program's syscall() holds that write
+# inside the window until fork has returned in the parent.
+cat > "$WORK/tracer-fsize/forkhook.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <pthread.h>
+static void call_program_hook(void) {
+  void (*hook)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "program_prepare_hook");
+  if (hook != NULL) hook();
+}
+__attribute__((constructor)) static void register_hook(void) {
+  pthread_atfork(call_program_hook, NULL, NULL);
+}
+EOF
+cat > "$WORK/tracer-fsize/window_restore.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static long (*next_syscall)(long, ...);
+static int may_record, is_in_window, has_forked;
+static struct rlimit tiny;
+static int has_tiny_limit(void) {
+  struct rlimit now;
+  return getrlimit(RLIMIT_FSIZE, &now) == 0 && now.rlim_cur == tiny.rlim_cur &&
+         now.rlim_max == tiny.rlim_max;
+}
+long syscall(long number, ...) {
+  if (next_syscall == NULL) next_syscall = (long (*)(long, ...))dlsym(RTLD_NEXT, "syscall");
+  long args[6];
+  va_list a;
+  va_start(a, number);
+  for (int i = 0; i < 6; ++i) args[i] = va_arg(a, long);
+  va_end(a);
+  if (number == SYS_write && !__atomic_load_n(&is_in_window, __ATOMIC_SEQ_CST) &&
+      memmem((const void *)args[1], (size_t)args[2], "held-across-fork", 16) != NULL) {
+    __atomic_store_n(&is_in_window, 1, __ATOMIC_SEQ_CST);
+    while (!__atomic_load_n(&has_forked, __ATOMIC_SEQ_CST)) sched_yield();
+  }
+  return next_syscall(number, args[0], args[1], args[2], args[3], args[4], args[5]);
+}
+void program_prepare_hook(void) {
+  __atomic_store_n(&may_record, 1, __ATOMIC_SEQ_CST);
+  while (!__atomic_load_n(&is_in_window, __ATOMIC_SEQ_CST)) sched_yield();
+}
+static void *record_in_window(void *arg) {
+  (void)arg;
+  while (!__atomic_load_n(&may_record, __ATOMIC_SEQ_CST)) sched_yield();
+  return (void *)(intptr_t)(open("absent-held-across-fork", O_RDONLY) >= 0);
+}
+int main(void) {
+  struct rlimit before;
+  if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
+  tiny.rlim_cur = 8;
+  tiny.rlim_max = before.rlim_max;
+  if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
+  if (open("absent-before-fork", O_RDONLY) >= 0) return 12;
+  pthread_t recorder;
+  if (pthread_create(&recorder, NULL, record_in_window, NULL) != 0) return 13;
+  pid_t child = fork();
+  if (child == 0) _exit(has_tiny_limit() ? 0 : 2);
+  __atomic_store_n(&has_forked, 1, __ATOMIC_SEQ_CST);
+  pthread_join(recorder, NULL);
+  int status = -1;
+  if (child > 0) waitpid(child, &status, 0);
+  if (!has_tiny_limit()) return 14;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 9;
+}
+EOF
+gcc -fPIC -shared "$WORK/tracer-fsize/forkhook.c" -o "$WORK/tracer-fsize/libforkhook.so" -ldl
+gcc -pthread -rdynamic "$WORK/tracer-fsize/window_restore.c" -o "$WORK/tracer-fsize/window_restore" \
+  -L"$WORK/tracer-fsize" -Wl,--no-as-needed -lforkhook -Wl,-rpath,"$WORK/tracer-fsize" -ldl
+( cd "$WORK/tracer-fsize" && timeout -s KILL 20 env VCACHE_TRACE_LOG="$WORK/tracer-fsize/restore.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./window_restore )
+check "a fork child copied with a window's lifted limit starts with the program's limit" "$?" "0"
+
 if [[ "$(id -u)" != 0 ]]; then
   mkdir -p "$WORK/tracer-sealed"
   cat > "$WORK/tracer-sealed/seal.c" <<'EOF'
