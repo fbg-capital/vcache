@@ -5073,6 +5073,10 @@ __attribute__((constructor)) static void stub(void) {
   const char *log = getenv("VCACHE_TRACE_LOG");
   const char *mode = getenv("STUB_MODE");
   if (log == NULL || mode == NULL) return;
+  /* These fixtures exercise text-record guards, not mixed-format refusal.
+     Replace the parent's empty mapped header before writing the fixture. */
+  int empty = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (empty >= 0) close(empty);
   if (strcmp(mode, "incomplete") == 0) {
     /* Write a trace that is otherwise complete and usable -- including a
        process record, so the empty-tools guard is not what rejects it -- and
@@ -5080,7 +5084,8 @@ __attribute__((constructor)) static void stub(void) {
        stored, or the test proves nothing. */
     int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd >= 0) {
-      (void)!write(fd, "P\t/bin/sh\nR\t/etc/hostname\n", 27);
+      const char *text = "P\t/bin/sh\nR\t/etc/hostname\n";
+      (void)!write(fd, text, strlen(text));
       close(fd);
     }
     char marker[4096];
@@ -5171,6 +5176,13 @@ reset_cache
 ( cd "$WORK/link-one" && env -u VCACHE_LINK_CACHE "$VCACHE" \
     --vcache-root="$PWD=proj" gcc helper.o main.o -o app-off ) 2>/dev/null
 check "link caching is off by default" "$(disk_entries)" "0"
+
+if PYTHONDONTWRITEBYTECODE=1 python3 "$TOP/tests/trace_mapped_test.py" \
+    "$VCACHE" "$TOP/bin/vcache_test"; then
+  ok "mapped trace process-tree and failure checks pass"
+else
+  bad "mapped trace process-tree and failure checks pass"
+fi
 
 unset VCACHE_LINK_CACHE
 fi
@@ -6070,8 +6082,8 @@ if [[ -f "$WORK/stub-tracer.so" ]]; then
   reset_cache
   l=$(mf_log trace-nolog)
   mf_traced "$l" VCACHE_TRACER="$WORK/stub-tracer.so"
-  check "a tracer that writes no log is reported as never loaded" \
-    "$(grep -c 'no process loaded the tracer; recording from the depfile' "$l")" "1"
+  check "a tracer that writes no records leaves an unusable trace" \
+    "$(grep -c 'the trace did not parse; recording from the depfile' "$l")" "1"
   # vcache does not replace or extend a preload the build set.
   reset_cache
   rm -f "$tl/calls"

@@ -3,14 +3,22 @@
 #include "core/link_trace.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 #include <algorithm>
 #include <cstdlib>
+#include <cerrno>
+#include <cstring>
 #include <optional>
 
+#include "trace/format.h"
 #include "util/fs.h"
+#include "util/log.h"
 #include "util/str.h"
 
 namespace vcache::core {
@@ -20,7 +28,134 @@ bool HasPrefix(const std::string& p, std::string_view prefix) {
   return util::StartsWith(p, prefix);
 }
 
+bool AppendTraceRecord(std::string_view line, TraceRecords* out) {
+  if (line.size() < 3 || line[1] != '\t' || line[2] != '/') return false;
+  std::string path(line.substr(2));
+  switch (line[0]) {
+    case 'R': out->reads.push_back(std::move(path)); break;
+    case 'M': out->absent.push_back(std::move(path)); break;
+    case 'P': out->tools.push_back(std::move(path)); break;
+    case 'L': out->loaded.push_back(std::move(path)); break;
+    case 'W': out->written.push_back(std::move(path)); break;
+    case 'D': break;
+    default: return false;
+  }
+  return true;
+}
+
+bool ZeroTracePadding(std::string_view bytes) {
+  return std::all_of(bytes.begin(), bytes.end(), [](char byte) { return byte == 0; });
+}
+
+bool ReadMappedTrace(std::string_view bytes, TraceRecords* out, std::string* reason) {
+  const auto refuse = [&](const char* why) {
+    *reason = why;
+    return false;
+  };
+  if (bytes.size() < VCACHE_TRACE_HEADER_BYTES) return refuse("truncated header");
+  vcache_trace_header header;
+  std::memcpy(&header, bytes.data(), sizeof(header));
+  if (std::memcmp(&header, &vcache_trace_header_v1, 32) != 0 ||
+      !ZeroTracePadding(bytes.substr(40, VCACHE_TRACE_HEADER_BYTES - 40))) {
+    return refuse("unsupported header layout");
+  }
+  if (header.incomplete != 0) return refuse("writer reported a lost record");
+  if (header.reserved_chunks == 0 || header.reserved_chunks > VCACHE_TRACE_MAX_CHUNKS) {
+    return refuse("invalid reservation count");
+  }
+  const uint64_t expected_bytes = VCACHE_TRACE_HEADER_BYTES +
+      static_cast<uint64_t>(header.reserved_chunks) * VCACHE_TRACE_CHUNK_BYTES;
+  if (bytes.size() != expected_bytes) return refuse("reservation/file size mismatch");
+  for (uint32_t chunk = 0; chunk < header.reserved_chunks; ++chunk) {
+    const size_t start = VCACHE_TRACE_HEADER_BYTES + size_t{chunk} * VCACHE_TRACE_CHUNK_BYTES;
+    const std::string_view block = bytes.substr(start, VCACHE_TRACE_CHUNK_BYTES);
+    uint32_t state;
+    std::memcpy(&state, block.data(), sizeof(state));
+    if (state != VCACHE_TRACE_CHUNK_COMMITTED ||
+        !ZeroTracePadding(block.substr(4, VCACHE_TRACE_CHUNK_HEADER_BYTES - 4))) {
+      return refuse("unpublished or unfinished chunk");
+    }
+    size_t offset = VCACHE_TRACE_CHUNK_HEADER_BYTES;
+    bool has_record = false;
+    while (offset < block.size()) {
+      uint32_t length;
+      std::memcpy(&length, block.data() + offset, sizeof(length));
+      if (length == 0) {
+        if (!ZeroTracePadding(block.substr(offset))) return refuse("unpublished tail");
+        break;
+      }
+      if (length < 4 || length > VCACHE_TRACE_RECORD_MAX ||
+          length > block.size() - offset - 4) return refuse("uncommitted or invalid record length");
+      const size_t record_bytes = (4 + size_t{length} + 7) & ~size_t{7};
+      if (record_bytes > block.size() - offset) return refuse("record crosses chunk boundary");
+      const std::string_view record = block.substr(offset + 4, length);
+      if (record.back() != '\n' || record.substr(2, length - 3).find_first_of(
+              std::string_view("\0\n\t", 3)) != std::string_view::npos ||
+          !ZeroTracePadding(block.substr(offset + 4 + length, record_bytes - 4 - length)) ||
+          !AppendTraceRecord(record.substr(0, length - 1), out)) return refuse("malformed record");
+      has_record = true;
+      offset += record_bytes;
+    }
+    if (!has_record) return refuse("empty reserved chunk");
+  }
+  return true;
+}
+
+#if defined(__linux__) && defined(__LP64__)
+bool AllocateTraceHeader(int fd) {
+  sigset_t blocked, previous;
+  ::sigemptyset(&blocked);
+  ::sigaddset(&blocked, SIGXFSZ);
+  if (::pthread_sigmask(SIG_BLOCK, &blocked, &previous) != 0) return false;
+  int error;
+  do { error = ::posix_fallocate(fd, 0, VCACHE_TRACE_HEADER_BYTES); } while (error == EINTR);
+  bool complete = false;
+  if (error == 0) {
+    ssize_t written;
+    do { written = ::pwrite(fd, &vcache_trace_header_v1, sizeof(vcache_trace_header_v1), 0); }
+    while (written < 0 && errno == EINTR);
+    complete = written == sizeof(vcache_trace_header_v1);
+    error = written < 0 ? errno : 0;
+  }
+  if (error == EFBIG && !::sigismember(&previous, SIGXFSZ)) {
+    const timespec no_wait{};
+    ::sigtimedwait(&blocked, nullptr, &no_wait);
+  }
+  ::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+  return complete;
+}
+#endif
+
 }  // namespace
+
+bool PrepareTraceLog(const std::string& log_path) {
+#if defined(__linux__) && defined(__LP64__)
+  const long page_bytes = ::sysconf(_SC_PAGESIZE);
+  if (page_bytes > 0 && VCACHE_TRACE_HEADER_BYTES % page_bytes == 0 &&
+      VCACHE_TRACE_CHUNK_BYTES % page_bytes == 0 && __atomic_always_lock_free(4, nullptr)) {
+    const int fd = ::open(log_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+      struct statfs filesystem {};
+      bool mapped = ::fstatfs(fd, &filesystem) == 0 &&
+          (filesystem.f_type == 0xef53 || filesystem.f_type == 0x58465342 ||
+           filesystem.f_type == 0x9123683e || filesystem.f_type == 0x01021994);
+      if (mapped) {
+        mapped = AllocateTraceHeader(fd);
+      }
+      ::close(fd);
+      if (mapped) {
+        VCACHE_LOG("trace: format=mmap-v1 chunk_bytes=65536 max_chunks=4096");
+        return true;
+      }
+      // This file is ours and no writer has started; text fallback must not
+      // inherit a partial binary header or an allocated zero tail.
+      util::RemoveFile(log_path);
+    }
+  }
+#endif
+  VCACHE_LOG("trace: format=text (mapped setup unavailable)");
+  return false;
+}
 
 bool IsIgnoredPath(const std::string& path) {
   if (path.empty() || path[0] != '/') return true;  // relative junk from argv
@@ -58,8 +193,22 @@ bool IsIgnoredPath(const std::string& path) {
 }
 
 bool ReadTraceRecords(const std::string& log_path, TraceRecords* out) {
+  struct stat info {};
+  if (::stat(log_path.c_str(), &info) != 0 || info.st_size < 0 ||
+      static_cast<uint64_t>(info.st_size) > VCACHE_TRACE_MAX_BYTES ||
+      !(info.st_mode & S_IRUSR)) return false;
   auto text = util::ReadFile(log_path);
   if (!text) return false;
+  TraceRecords records;
+  if (text->size() >= 8 && std::memcmp(text->data(), vcache_trace_header_v1.magic, 8) == 0) {
+    std::string reason;
+    const bool complete = ReadMappedTrace(*text, &records, &reason);
+    VCACHE_LOG(complete ? "trace: format=mmap-v1 complete" :
+                         "trace: format=mmap-v1 incomplete (" + reason + ")");
+    if (!complete) return false;
+    *out = std::move(records);
+    return true;
+  }
   // Every record ends in a newline. A log that does not was cut off mid-write
   // (ENOSPC, RLIMIT_FSIZE) and its last line may be a prefix of a path.
   if (!text->empty() && text->back() != '\n') return false;
@@ -70,21 +219,12 @@ bool ReadTraceRecords(const std::string& log_path, TraceRecords* out) {
     // A malformed line is a missing dependency record. Partial traces cannot
     // be trusted: skipping one can turn a required input into a false hit.
     if (line.size() < 3 || line[1] != '\t') return false;
-    const char kind = line[0];
     // A tracer from before records were made absolute: joining the record to
     // any directory here can name a file the process never touched.
     if (line[2] != '/') return false;
-    std::string path = line.substr(2);
-    switch (kind) {
-      case 'R': out->reads.push_back(std::move(path)); break;
-      case 'M': out->absent.push_back(std::move(path)); break;
-      case 'P': out->tools.push_back(std::move(path)); break;
-      case 'L': out->loaded.push_back(std::move(path)); break;
-      case 'W': out->written.push_back(std::move(path)); break;
-      case 'D': break;  // listings are covered by the paths probed within them
-      default: return false;
-    }
+    if (!AppendTraceRecord(line, &records)) return false;
   }
+  *out = std::move(records);
   return true;
 }
 

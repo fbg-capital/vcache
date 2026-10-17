@@ -818,13 +818,21 @@ for counters, read-only/recache behavior and the cost of this opt-in mode.
   directory between another's call and its record misattributes that record. A
   reader refuses a trace holding a relative record, which only a tracer from
   before this rule writes: the directory it was relative to is unknown. It also
-  refuses a nonempty trace without a final newline, which may end in a partial
-  path. The tracer retains its log name from startup so clearing the environment
+  refuses a nonempty legacy text trace without a final newline, which may end in
+  a partial path. The tracer retains its log name from startup so clearing the environment
   cannot prevent it from marking a later lost record.
   C/C++ manifest keys version 9 and link keys version 6 retain invalidation of
   entries recorded before these tracer fixes. The colon renderer repair also
   invalidates old depfiles: C/C++ key version 8, dep-scan version 6, Rust result
   version 6 and Rust manifest version 4.
+- **Mapped trace publication detects incomplete writers.** On supported local
+  Linux storage the parent opts into versioned 64 KiB mapped chunks before
+  launching the process tree. Each thread owns its chunks; reservations and
+  release-published record/chunk states expose interrupted allocation or writes.
+  A shared incomplete flag survives failure to create the sidecar marker.
+  Unsupported setup selects legacy append transport for the invocation. The
+  reader accepts old text and refuses malformed or unfinished mapped files.
+  See [the layout and compatibility contract](mapped-trace.md).
 - **A probe that fails for a reason other than `ENOENT` records nothing.** The
   tracer records a successful open or probe as an input (`R`) and an `ENOENT`
   failure as an absence (`M`); `EACCES`, `ENOTDIR`, `ELOOP` and every other

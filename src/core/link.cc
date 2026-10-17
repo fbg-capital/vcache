@@ -578,6 +578,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   util::ProcOptions opts;
   opts.capture_stderr = true;
   opts.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
+  opts.env.emplace_back("VCACHE_TRACE_FORMAT", PrepareTraceLog(trace_log) ? "mmap-v1" : "text");
   opts.env.emplace_back("LD_PRELOAD", tracer);
   if (session && config.daemon.admission && daemon::AncestorHoldsReservation()) {
     VCACHE_LOG("reserve: an enclosing vcache holds the reservation; not reserving again");

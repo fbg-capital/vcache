@@ -121,7 +121,16 @@ def run(binary, work):
                                  'cat "$VCACHE_TRACE_LOG.edited" > "$VCACHE_TRACE_LOG"',
                 "changed-input": 'printf "/* changed during compile */\\n" >> h.h',
             }[damage]
-            wrapper.write_text("#!/bin/sh\n" + shlex.quote(shutil.which(compiler)) + ' "$@"\n'
+            # Corrupt legacy text after all mapped writers have exited. Truncating
+            # a live mapping would test SIGBUS, not the consumer's refusal guard.
+            wrapper.write_text("#!/bin/sh\n"
+                               'if [ -n "${LD_PRELOAD:-}" ]; then\n'
+                               '  export VCACHE_TEST_PRELOAD="$LD_PRELOAD"\n'
+                               '  unset LD_PRELOAD\n  exec "$0" "$@"\nfi\n'
+                               'if [ -n "${VCACHE_TRACE_LOG:-}" ]; then\n'
+                               '  : > "$VCACHE_TRACE_LOG"\nfi\n'
+                               'VCACHE_TRACE_FORMAT=text LD_PRELOAD="${VCACHE_TEST_PRELOAD:-}" '
+                               + shlex.quote(shutil.which(compiler)) + ' "$@"\n'
                                'status=$?\nif [ "$status" = 0 ] && [ -n "${VCACHE_TRACE_LOG:-}" ]; then\n'
                                + action + '\nfi\nexit "$status"\n')
             wrapper.chmod(0o755)

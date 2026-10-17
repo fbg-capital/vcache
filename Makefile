@@ -330,7 +330,7 @@ DEPS     := $(ALL_OBJS:.o=.d)
 all: $(BINDIR)/vcache $(TRACER_SO)
 
 ifeq ($(HOST_OS),Linux)
-$(TRACER_SO): $(TRACER_SRC) $(TOP)/Makefile
+$(TRACER_SO): $(TRACER_SRC) $(SRC)/trace/format.h $(TOP)/Makefile
 	@mkdir -p $(BINDIR)
 	$(CC) -std=c11 -O2 -fPIC -shared -pthread -Wall -Wextra -Wl,-z,defs -o $@ $< -ldl
 endif

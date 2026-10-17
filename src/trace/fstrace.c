@@ -46,18 +46,44 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "format.h"
+
 static int log_fd = -1;
 
-/* Records must fit in one write. A path is bounded by PATH_MAX, but the tracer
+/* Records must fit in one publication. A path is bounded by PATH_MAX, but the tracer
    also sees strings that merely occupy a path argument, so the bound is
    enforced rather than assumed. */
-#define VCACHE_RECORD_MAX 4096
+#define VCACHE_RECORD_MAX VCACHE_TRACE_RECORD_MAX
+
+static int log_init_state;
+static int log_init_lost_record;
+enum trace_mode { VCACHE_TRACE_TEXT, VCACHE_TRACE_MAPPED, VCACHE_TRACE_REFUSED };
+static enum trace_mode trace_mode;
+static struct vcache_trace_header *trace_header;
+
+/* Initial-exec TLS avoids a loader allocation from inside an interposed call.
+   The library is loaded by LD_PRELOAD, before application threads exist. */
+static __thread struct {
+  volatile sig_atomic_t pid;
+  volatile sig_atomic_t emitting;
+  volatile sig_atomic_t fork_pending;
+  char *chunk;
+  uint32_t offset;
+} trace_thread __attribute__((tls_model("initial-exec")));
+
+#ifdef VCACHE_TRACE_TEST_HOOK
+extern int vcache_trace_test_phase(const char *phase);
+#define TRACE_PHASE(phase) vcache_trace_test_phase(phase)
+#else
+#define TRACE_PHASE(phase) 0
+#endif
 
 /* VCACHE_TRACE_LOG, or NULL when tracing is off. A relative name counts as
    unset: the log and its marker would land in whatever directory each process
@@ -83,18 +109,58 @@ static const char *log_path(void) {
 
 static void mark_incomplete(void);
 
-static void ensure_log(void) {
-  if (log_fd != -1) return;
-  const char *p = log_path();
-  if (p == NULL) { log_fd = -2; return; }
-  log_fd = (int)syscall(SYS_openat, AT_FDCWD, p,
-                        O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-  if (log_fd < 0) {
-    /* Every record of this process is lost. The marker is the only channel
-       left; it may fail for the same reason, which the caller cannot see. */
-    log_fd = -2;
-    mark_incomplete();
+static int ensure_log(void) {
+  int state = __atomic_load_n(&log_init_state, __ATOMIC_ACQUIRE);
+  if (state == -1) return log_fd >= 0 && trace_mode != VCACHE_TRACE_REFUSED;
+  const int pid = (int)syscall(SYS_getpid);
+  if ((state != 0 && state == pid) ||
+      !__atomic_compare_exchange_n(&log_init_state, &state, pid, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&log_init_lost_record, 1, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&log_init_state, __ATOMIC_ACQUIRE) == -1) mark_incomplete();
+    return 0;
   }
+  const char *p = log_path();
+  if (p == NULL) {
+    log_fd = -2;
+    __atomic_store_n(&log_init_state, -1, __ATOMIC_RELEASE);
+    return 0;
+  }
+  const char *format = getenv("VCACHE_TRACE_FORMAT");
+  const int requested = format != NULL && strcmp(format, "mmap-v1") == 0;
+  trace_mode = requested ? VCACHE_TRACE_REFUSED : VCACHE_TRACE_TEXT;
+  log_fd = TRACE_PHASE("log-open") ? -1 :
+      (int)syscall(SYS_openat, AT_FDCWD, p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  struct vcache_trace_header header;
+  long got = -1;
+  if (log_fd >= 0) {
+    do { got = syscall(SYS_read, log_fd, &header, sizeof header); }
+    while (got < 0 && errno == EINTR);
+  }
+  if (got >= 8 && memcmp(header.magic, vcache_trace_header_v1.magic, 8) == 0) {
+    trace_mode = VCACHE_TRACE_REFUSED;
+#if defined(__LP64__) && defined(SYS_mmap) && defined(SYS_fallocate)
+    struct stat info;
+    if (got == sizeof header && __atomic_always_lock_free(4, 0) &&
+        memcmp(&header, &vcache_trace_header_v1, 32) == 0 &&
+        memcmp(header.padding, vcache_trace_header_v1.padding, sizeof header.padding) == 0 &&
+        syscall(SYS_fstat, log_fd, &info) == 0 && info.st_size >= VCACHE_TRACE_HEADER_BYTES) {
+      void *mapped = TRACE_PHASE("header-map") ? MAP_FAILED :
+          (void *)syscall(SYS_mmap, NULL, VCACHE_TRACE_HEADER_BYTES,
+                          PROT_READ | PROT_WRITE, MAP_SHARED, log_fd, 0);
+      if (mapped != MAP_FAILED) {
+        trace_header = mapped;
+        if (requested) trace_mode = VCACHE_TRACE_MAPPED;
+      }
+    }
+#endif
+  } else if (!requested && log_fd >= 0) {
+    if (syscall(SYS_fcntl, log_fd, F_SETFL, O_APPEND) != 0) log_fd = -2;
+  }
+  __atomic_store_n(&log_init_state, -1, __ATOMIC_RELEASE);
+  if (log_fd < 0 || trace_mode == VCACHE_TRACE_REFUSED ||
+      __atomic_load_n(&log_init_lost_record, __ATOMIC_ACQUIRE)) mark_incomplete();
+  return log_fd >= 0 && trace_mode != VCACHE_TRACE_REFUSED;
 }
 
 /* What one write of the record returned, past EINTR: `n` when it all landed. */
@@ -270,7 +336,23 @@ static int fsize_load_fork_reading(struct rlimit64 *program_limit) {
   return __atomic_load_n(&fsize_fork_reading_seq, __ATOMIC_SEQ_CST) == seq;
 }
 
-static void fsize_after_fork_in_child(void) {
+static void trace_after_fork_in_child(void) {
+  const int saved = errno;
+  if (trace_thread.emitting) {
+    /* A handler may return into an interrupted emitter with live pointers
+       into its inherited chunk. Keep that mapping, but refuse this trace. */
+    trace_thread.pid = (int)syscall(SYS_getpid);
+    mark_incomplete();
+  } else {
+    /* A child in a new PID namespace can have the parent's numeric PID. */
+    trace_thread.pid = 0;
+  }
+  trace_thread.fork_pending = 0;
+  errno = saved;
+}
+
+static void after_fork_in_child(void) {
+  trace_after_fork_in_child();
   struct rlimit64 program_limit, now;
   if (fsize_load_fork_reading(&program_limit)) {
     if (program_limit.rlim_cur < program_limit.rlim_max && prlimit_fsize(NULL, &now) == 0 &&
@@ -377,8 +459,7 @@ static int append_record(const char *buf, size_t n) {
 /* A "!" line, which readers refuse the whole log on. It starts with a newline
    of its own: a torn record has none, and "R\t/x/ab!" would read as a record. */
 static void write_incomplete_sentinel(void) {
-  ensure_log();
-  if (log_fd < 0) return;
+  if (!ensure_log() || trace_mode != VCACHE_TRACE_TEXT) return;
   append_record("\n!\n", 3);
 }
 
@@ -387,21 +468,121 @@ static void write_incomplete_sentinel(void) {
    loud by creating "<log>.incomplete", which the caller checks before storing
    an entry. A marker whose name does not fit, or that its directory refuses,
    would leave the log looking whole -- possibly with other processes' P
-   records in it -- so the sentinel in the log is its backstop. */
+   records in it -- so the shared flag or text sentinel is its backstop. */
 static void mark_incomplete(void) {
+  if (__atomic_load_n(&log_init_state, __ATOMIC_ACQUIRE) != -1) {
+    __atomic_store_n(&log_init_lost_record, 1, __ATOMIC_RELEASE);
+    if (!ensure_log()) return;
+  }
+  if (trace_header != NULL) {
+    __atomic_store_n(&trace_header->incomplete, 1, __ATOMIC_RELEASE);
+  } else if (trace_mode != VCACHE_TRACE_TEXT && log_fd >= 0) {
+    const uint32_t incomplete = 1;
+    /* The header was allocated by the parent, so this does not need another
+       block even when extent allocation or header mapping failed. */
+    struct kernel_sigset blocked = {{1ULL << (SIGXFSZ - 1), 0}}, previous = {{0, 0}};
+    const int masked = syscall(SYS_rt_sigprocmask, SIG_BLOCK, &blocked, &previous,
+                                VCACHE_KERNEL_SIGSET_BYTES) == 0;
+    long result;
+    do { result = syscall(SYS_pwrite64, log_fd, &incomplete, sizeof incomplete, 36); }
+    while (result < 0 && errno == EINTR);
+    const int write_error = result < 0 ? errno : 0;
+    /* A child can exec under a hard size limit below the flag's offset.
+       Revoking read permission survives both that limit and failed mmap. */
+    if (result != sizeof incomplete) syscall(SYS_fchmod, log_fd, 0);
+    if (masked) {
+      if (write_error == EFBIG && !(previous.bits[0] & blocked.bits[0])) {
+        const struct timespec no_wait = {0, 0};
+        syscall(SYS_rt_sigtimedwait, &blocked, NULL, &no_wait, VCACHE_KERNEL_SIGSET_BYTES);
+      }
+      syscall(SYS_rt_sigprocmask, SIG_SETMASK, &previous, NULL, VCACHE_KERNEL_SIGSET_BYTES);
+    }
+  }
   const char *log = log_path();
   if (log == NULL) return;
+  if (trace_mode != VCACHE_TRACE_TEXT && log_fd < 0) {
+    syscall(SYS_fchmodat, AT_FDCWD, log, 0);
+  }
   static const char suffix[] = ".incomplete";
   char marker[PATH_MAX];
   size_t n = strlen(log);
   if (n + sizeof suffix <= sizeof marker) {
     memcpy(marker, log, n);
     memcpy(marker + n, suffix, sizeof suffix);
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, marker,
-                          O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    int fd = TRACE_PHASE("marker") ? -1 :
+        (int)syscall(SYS_openat, AT_FDCWD, marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
     if (fd >= 0) { syscall(SYS_close, fd); return; }
   }
-  write_incomplete_sentinel();
+  if (trace_mode == VCACHE_TRACE_TEXT) write_incomplete_sentinel();
+}
+
+static int allocate_trace_chunk(uint64_t offset) {
+#if defined(__LP64__) && defined(SYS_fallocate)
+  struct kernel_sigset blocked = {{1ULL << (SIGXFSZ - 1), 0}}, previous = {{0, 0}};
+  if (syscall(SYS_rt_sigprocmask, SIG_BLOCK, &blocked, &previous,
+              VCACHE_KERNEL_SIGSET_BYTES) != 0) return 0;
+  long result;
+  do {
+    result = TRACE_PHASE("allocate") ? -1 :
+        syscall(SYS_fallocate, log_fd, 0, offset, (uint64_t)VCACHE_TRACE_CHUNK_BYTES);
+  } while (result < 0 && errno == EINTR);
+  if (result < 0 && errno == EFBIG && !(previous.bits[0] & blocked.bits[0])) {
+    const struct timespec no_wait = {0, 0};
+    syscall(SYS_rt_sigtimedwait, &blocked, NULL, &no_wait, VCACHE_KERNEL_SIGSET_BYTES);
+  }
+  syscall(SYS_rt_sigprocmask, SIG_SETMASK, &previous, NULL, VCACHE_KERNEL_SIGSET_BYTES);
+  return result == 0;
+#else
+  return 0;
+#endif
+}
+
+static int append_mapped_record(const char *buf, uint32_t length) {
+#if defined(__LP64__) && defined(SYS_mmap)
+  if (__atomic_load_n(&trace_header->incomplete, __ATOMIC_ACQUIRE)) return 0;
+  const uint32_t bytes = (4 + length + 7) & ~7U;
+  if (trace_thread.chunk == NULL || trace_thread.offset > VCACHE_TRACE_CHUNK_BYTES - bytes) {
+    uint32_t chunk = __atomic_load_n(&trace_header->reserved_chunks, __ATOMIC_ACQUIRE);
+    do {
+      if (chunk >= VCACHE_TRACE_MAX_CHUNKS) return 0;
+    } while (!__atomic_compare_exchange_n(&trace_header->reserved_chunks, &chunk, chunk + 1,
+                                          0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    if (TRACE_PHASE("reserved")) return 0;
+    const uint64_t offset = VCACHE_TRACE_HEADER_BYTES + (uint64_t)chunk * VCACHE_TRACE_CHUNK_BYTES;
+    if (!allocate_trace_chunk(offset)) return 0;
+    if (TRACE_PHASE("allocated")) return 0;
+    void *mapped = TRACE_PHASE("chunk-map") ? MAP_FAILED :
+        (void *)syscall(SYS_mmap, NULL, VCACHE_TRACE_CHUNK_BYTES,
+                        PROT_READ | PROT_WRITE, MAP_SHARED, log_fd, offset);
+    if (mapped == MAP_FAILED) return 0;
+    if (trace_thread.chunk != NULL) {
+      syscall(SYS_munmap, trace_thread.chunk, VCACHE_TRACE_CHUNK_BYTES);
+    }
+    trace_thread.chunk = mapped;
+    trace_thread.offset = VCACHE_TRACE_CHUNK_HEADER_BYTES;
+  }
+  uint32_t *state = (uint32_t *)trace_thread.chunk;
+  __atomic_store_n(state, VCACHE_TRACE_CHUNK_WRITING, __ATOMIC_SEQ_CST);
+  if (TRACE_PHASE("writing")) return 0;
+  uint32_t *record = (uint32_t *)(trace_thread.chunk + trace_thread.offset);
+  __atomic_store_n(record, length | VCACHE_TRACE_RECORD_WRITING, __ATOMIC_SEQ_CST);
+  if (TRACE_PHASE("record-start")) return 0;
+#ifdef VCACHE_TRACE_TEST_HOOK
+  memcpy((char *)record + 4, buf, length / 2);
+  if (TRACE_PHASE("payload-half")) return 0;
+  memcpy((char *)record + 4 + length / 2, buf + length / 2, length - length / 2);
+#else
+  memcpy((char *)record + 4, buf, length);
+#endif
+  if (TRACE_PHASE("payload")) return 0;
+  __atomic_store_n(record, length, __ATOMIC_RELEASE);
+  if (TRACE_PHASE("record-commit")) return 0;
+  trace_thread.offset += bytes;
+  __atomic_store_n(state, VCACHE_TRACE_CHUNK_COMMITTED, __ATOMIC_RELEASE);
+  return 1;
+#else
+  return 0;
+#endif
 }
 
 /* The working directory, written to `out` with a trailing '/', and its length;
@@ -424,11 +605,11 @@ static const char *maybe_null(const char *path) {
   return path;
 }
 
-static void emit(char kind, const char *path) {
+static void emit_record(char kind, const char *path) {
   path = maybe_null(path);
   if (path == NULL || *path == '\0') return;
-  ensure_log();
-  if (log_fd < 0) return;
+  if (!ensure_log()) return;
+  if (trace_header != NULL && __atomic_load_n(&trace_header->incomplete, __ATOMIC_ACQUIRE)) return;
 
   char buf[VCACHE_RECORD_MAX];
   size_t n = 0;
@@ -466,11 +647,56 @@ static void emit(char kind, const char *path) {
   }
   buf[n++] = '\n';
 
-  /* One record is one write. The whole process tree appends to one regular
+  /* In text mode, one record is one write. The process tree appends to one regular
      file, where O_APPEND makes each write land whole and contiguous; a second
      write for the rest of a short one can land after another process's record
      and tear both. So a short write is a lost record, and is made loud. */
-  if (!append_record(buf, n)) mark_incomplete();
+  if (!(trace_mode == VCACHE_TRACE_MAPPED ? append_mapped_record(buf, (uint32_t)n)
+                                        : append_record(buf, n))) {
+    mark_incomplete();
+  }
+}
+
+static void emit(char kind, const char *path) {
+  if (__atomic_load_n(&log_init_state, __ATOMIC_ACQUIRE) == -1 &&
+      trace_mode == VCACHE_TRACE_TEXT) {
+    emit_record(kind, path);
+    return;
+  }
+  if (trace_thread.fork_pending) {
+    mark_incomplete();
+    return;
+  }
+  const int pid = (int)syscall(SYS_getpid);
+  if (trace_thread.pid != pid) {
+    struct kernel_sigset all_signals, previous;
+    memset(&all_signals, 0xff, sizeof all_signals);
+    if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all_signals, &previous,
+                VCACHE_KERNEL_SIGSET_BYTES) != 0) {
+      mark_incomplete();
+      return;
+    }
+    const int interrupted = trace_thread.emitting;
+    if (interrupted) {
+      trace_thread.pid = pid;
+      mark_incomplete();
+    } else if (trace_thread.pid != pid) {
+      char *inherited = trace_thread.chunk;
+      trace_thread.chunk = NULL;
+      trace_thread.offset = 0;
+      trace_thread.pid = pid;
+      if (inherited != NULL) syscall(SYS_munmap, inherited, VCACHE_TRACE_CHUNK_BYTES);
+    }
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &previous, NULL, VCACHE_KERNEL_SIGSET_BYTES);
+    if (interrupted) return;
+  }
+  if (trace_thread.emitting) {
+    mark_incomplete();
+    return;
+  }
+  trace_thread.emitting = 1;
+  emit_record(kind, path);
+  trace_thread.emitting = 0;
 }
 
 /* Only ENOENT counts as a negative input. A permission error is a different
@@ -575,6 +801,28 @@ static int stats_descriptor(const char *path, int flags) {
     next_##sym;                                       \
   })
 
+typedef pid_t (*fork_function)(void);
+
+static fork_function resolve_fork(void) {
+  return NEXT(fork);
+}
+
+pid_t fork(void) {
+  const int entry_errno = errno;
+  fork_function real_fork = resolve_fork();
+  if (real_fork == NULL) { errno = ENOSYS; return -1; }
+  const sig_atomic_t previous = trace_thread.fork_pending;
+  trace_thread.fork_pending = 1;
+  errno = entry_errno;
+  const pid_t child = real_fork();
+  const int saved = errno;
+  /* Reset ownership even when registered handlers were not run. */
+  if (child == 0) trace_after_fork_in_child();
+  trace_thread.fork_pending = previous;
+  errno = saved;
+  return child;
+}
+
 /* Our own load address, so we can leave ourselves out of the input set.
    Compared by base rather than by name: dladdr and dl_iterate_phdr can spell
    the same object differently, and a name comparison would quietly stop
@@ -634,7 +882,8 @@ static int announce_object(struct dl_phdr_info *info, size_t size, void *data) {
 }
 
 __attribute__((constructor)) static void announce_self(void) {
-  pthread_atfork(fsize_before_fork, NULL, fsize_after_fork_in_child);
+  (void)resolve_fork();
+  pthread_atfork(fsize_before_fork, NULL, after_fork_in_child);
   char exe[4096];
   long n = syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe, sizeof exe - 1);
   if (n > 0) { exe[n] = '\0'; emit('P', exe); }
@@ -959,9 +1208,9 @@ DIR *fdopendir(int fd) {
    call, and a successful one leaves the marker in the directory the reader
    looks in. A failed call changes nothing and leaves none. */
 int chroot(const char *path) {
+  ensure_log();
   const char *log = log_path();
   if (log == NULL) return NEXT(chroot)(path);
-  ensure_log();
   char dir[PATH_MAX];
   const char *base = strrchr(log, '/') + 1;
   size_t dir_len = (size_t)(base - log);
@@ -974,6 +1223,7 @@ int chroot(const char *path) {
   int r = NEXT(chroot)(path);
   int saved = errno;
   if (r == 0) {
+    if (trace_mode != VCACHE_TRACE_TEXT) mark_incomplete();
     static const char suffix[] = ".incomplete";
     char marker[PATH_MAX];
     size_t n = strlen(base);

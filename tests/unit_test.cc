@@ -50,6 +50,7 @@
 
 #include "args/compiler_args.h"
 #include "core/link_trace.h"
+#include "trace/format.h"
 #include "core/link.h"
 #include "args/link_args.h"
 #include "args/rustc_args.h"
@@ -383,6 +384,121 @@ void TestLinkTraceClassification() {
   Check(!core::ParseTraceLog(log, {}, "/home/u/proj", &relative_trace),
         "and so is a link trace holding one");
   util::RemoveRecursive(dir);
+}
+
+void TestMappedTraceRecords() {
+  Section("core::mapped_trace");
+  const auto directory = util::MakeTempDir("vcache-mapped-trace");
+  Check(directory.has_value(), "mapped trace scratch exists");
+  if (!directory) return;
+  struct Guard {
+    std::string path;
+    ~Guard() { util::RemoveRecursive(path); }
+  } guard{*directory};
+  const std::string path = *directory + "/trace";
+  const auto word = [](std::string* bytes, size_t offset, uint32_t value) {
+    std::memcpy(bytes->data() + offset, &value, sizeof(value));
+  };
+  const auto record = [&](std::string* bytes, size_t offset, const std::string& line) {
+    word(bytes, offset, static_cast<uint32_t>(line.size()));
+    bytes->replace(offset + 4, line.size(), line);
+    return offset + ((4 + line.size() + 7) & ~size_t{7});
+  };
+  std::string complete(VCACHE_TRACE_HEADER_BYTES + 2 * VCACHE_TRACE_CHUNK_BYTES, '\0');
+  auto header = vcache_trace_header_v1;
+  header.reserved_chunks = 2;
+  std::memcpy(complete.data(), &header, sizeof(header));
+  word(&complete, VCACHE_TRACE_HEADER_BYTES, VCACHE_TRACE_CHUNK_COMMITTED);
+  word(&complete, VCACHE_TRACE_HEADER_BYTES + VCACHE_TRACE_CHUNK_BYTES,
+       VCACHE_TRACE_CHUNK_COMMITTED);
+  size_t cursor = VCACHE_TRACE_HEADER_BYTES + VCACHE_TRACE_CHUNK_HEADER_BYTES;
+  for (const std::string line : {"R\t/a/sub/../input\\name\n", "M\t/missing\n", "P\t/tool\n",
+                                  "L\t/library\n", "W\t/output\n", "D\t/directory\n"}) {
+    cursor = record(&complete, cursor, line);
+  }
+  const size_t second_record = VCACHE_TRACE_HEADER_BYTES + VCACHE_TRACE_CHUNK_BYTES +
+                               VCACHE_TRACE_CHUNK_HEADER_BYTES;
+  record(&complete, second_record, "R\t/second\n");
+  util::WriteFileAtomic(path, complete, false);
+  core::TraceRecords parsed;
+  Check(core::ReadTraceRecords(path, &parsed), "committed mapped dependency records parse");
+  Check(parsed.reads == std::vector<std::string>{"/a/sub/../input\\name", "/second"} &&
+            parsed.absent == std::vector<std::string>{"/missing"} &&
+            parsed.tools == std::vector<std::string>{"/tool"} &&
+            parsed.loaded == std::vector<std::string>{"/library"} &&
+            parsed.written == std::vector<std::string>{"/output"},
+        "mapped records preserve every kind and exact path spelling");
+  const auto refuses = [&](std::string bytes, const std::string& name) {
+    util::WriteFileAtomic(path, bytes, false);
+    core::TraceRecords rejected;
+    Check(!core::ReadTraceRecords(path, &rejected), name + " refuses the lost dependency");
+    Check(rejected.reads.empty() && rejected.tools.empty(), name + " publishes no partial set");
+  };
+  const auto changed_word = [&](size_t offset, uint32_t value, const std::string& name) {
+    std::string bytes = complete;
+    word(&bytes, offset, value);
+    refuses(std::move(bytes), name);
+  };
+  changed_word(8, 99, "unknown format version");
+  changed_word(12, 0x04030201, "wrong byte order");
+  changed_word(16, 64, "wrong header size");
+  changed_word(20, 128, "wrong chunk size");
+  changed_word(24, UINT32_MAX, "unbounded chunk capacity");
+  changed_word(28, 1, "reserved header word");
+  changed_word(32, 3, "reservation beyond EOF");
+  changed_word(32, UINT32_MAX, "reservation count overflow");
+  changed_word(36, 1, "shared incomplete flag");
+  changed_word(40, 1, "nonzero header reserved padding");
+  changed_word(128, 1, "nonzero header page padding");
+  changed_word(VCACHE_TRACE_HEADER_BYTES, 0, "reserved unpublished chunk");
+  changed_word(VCACHE_TRACE_HEADER_BYTES, 1, "writer killed before payload");
+  changed_word(VCACHE_TRACE_HEADER_BYTES, 99, "unknown chunk state");
+  changed_word(VCACHE_TRACE_HEADER_BYTES + 4, 1, "nonzero chunk reserved padding");
+  const size_t first_record = VCACHE_TRACE_HEADER_BYTES + VCACHE_TRACE_CHUNK_HEADER_BYTES;
+  uint32_t first_length;
+  std::memcpy(&first_length, complete.data() + first_record, sizeof(first_length));
+  changed_word(first_record, VCACHE_TRACE_RECORD_WRITING | first_length,
+               "in-progress record length");
+  changed_word(first_record, UINT32_MAX, "overflowing record length");
+  changed_word(first_record, 0, "payload without committed length");
+  changed_word(cursor + 8, 1, "nonzero unused tail");
+  changed_word(second_record, 0, "later chunk lost record");
+  std::string torn = complete;
+  torn[first_record + 4] = 'Q';
+  refuses(torn, "unknown record kind");
+  torn = complete;
+  torn[first_record + 6] = 'x';
+  refuses(torn, "relative mapped path");
+  torn = complete;
+  torn[first_record + 7] = '\0';
+  refuses(torn, "NUL in mapped path");
+  torn = complete;
+  torn[cursor - 1] = 'x';
+  refuses(torn, "damaged record padding");
+  refuses(complete.substr(0, 24), "truncated mapped header");
+  refuses(complete.substr(0, complete.size() - 1), "truncated chunk");
+  refuses(complete + "P\t/old-tracer\n", "legacy append to mapped log");
+  std::string oversized = complete;
+  std::fill(oversized.begin() + first_record,
+            oversized.begin() + VCACHE_TRACE_HEADER_BYTES + VCACHE_TRACE_CHUNK_BYTES, '\0');
+  record(&oversized, first_record, "R\t/" + std::string(VCACHE_TRACE_RECORD_MAX, 'x') + "\n");
+  refuses(oversized, "oversized mapped record");
+  std::string empty(VCACHE_TRACE_HEADER_BYTES, '\0');
+  std::memcpy(empty.data(), &vcache_trace_header_v1, sizeof(vcache_trace_header_v1));
+  refuses(empty, "header-only trace");
+  std::string boundary = complete;
+  std::fill(boundary.begin() + second_record, boundary.end(), '\0');
+  size_t next = second_record;
+  const std::string maximum = "R\t/" + std::string(VCACHE_TRACE_RECORD_MAX - 4, 'x') + "\n";
+  for (int index = 0; index < 15; ++index) next = record(&boundary, next, maximum);
+  const size_t remaining = boundary.size() - next;
+  record(&boundary, next, "R\t/" + std::string(remaining - 8, 'y') + "\n");
+  util::WriteFileAtomic(path, boundary, false);
+  core::TraceRecords edge;
+  Check(core::ReadTraceRecords(path, &edge) && edge.reads.size() == 17,
+        "maximum and exact chunk-boundary records retain dependencies");
+  word(&boundary, next, static_cast<uint32_t>(remaining));
+  refuses(boundary, "record crossing chunk boundary");
 }
 
 void TestStringUtils() {
@@ -7475,6 +7591,29 @@ void TestMemoryEstimates() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 3 && std::string(argv[1]) == "--prepare-trace") {
+    std::puts(core::PrepareTraceLog(argv[2]) ? "mmap-v1" : "text");
+    return 0;
+  }
+  if (argc == 3 && std::string(argv[1]) == "--read-trace") {
+    core::TraceRecords records;
+    if (core::TraceMarkedIncomplete(argv[2]) || !core::ReadTraceRecords(argv[2], &records)) {
+      return 1;
+    }
+    const auto print = [](char kind, const std::vector<std::string>& paths) {
+      for (const auto& path : paths) std::printf("%c\t%s\n", kind, path.c_str());
+    };
+    print('R', records.reads);
+    print('M', records.absent);
+    print('P', records.tools);
+    print('L', records.loaded);
+    print('W', records.written);
+    return 0;
+  }
+  if (argc == 2 && std::string(argv[1]) == "--trace-tests") {
+    TestMappedTraceRecords();
+    return g_fail == 0 ? 0 : 1;
+  }
   if (argc == 2 && std::string(argv[1]) == "--file-memo-tests") {
     TestFileDigestMemo();
     TestFileDigestTable();
@@ -7565,6 +7704,7 @@ int main(int argc, char** argv) {
   // Also after TestWrittenFileMode, and for the same reason: it writes
   // files, which primes util::DefaultFileMode()'s cached umask.
   TestLinkTraceClassification();
+  TestMappedTraceRecords();
   TestLinkVerifyOutputs();
   TestLinkVerifyConfigStats();
   TestStats();

@@ -37,11 +37,15 @@ struct TraceRecords {
   std::vector<std::string> written;  // W: opened for writing only
 };
 
+// Initializes mapped transport before launching any writer. False selects
+// legacy text for the whole invocation; the caller must override the format
+// environment in either case.
+bool PrepareTraceLog(const std::string& log_path);
+
 // False when the log cannot be read, any record is malformed or relative, or
-// the tracer wrote its "!" line to say it lost a record without being able to
-// mark the log incomplete; for the reason ParseTraceLog gives. A relative
-// record comes from a tracer that wrote paths as the process spelled them,
-// and the directory it was relative to is unknown.
+// publication is incomplete (including the legacy "!" sentinel); for the
+// reason ParseTraceLog gives. A relative record comes from a tracer that wrote
+// paths as the process spelled them, and its working directory is unknown.
 bool ReadTraceRecords(const std::string& log_path, TraceRecords* out);
 
 // True when the tracer could not record something and said so beside the log.
