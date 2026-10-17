@@ -76,6 +76,12 @@ mkdir -p "$WORK/devtoolset/bin"
 writeCompilers "$WORK/devtoolset/bin" dc-build gcc g++ ''
 printf 'export PATH=%s:$PATH\n' "$WORK/devtoolset/bin" >"$WORK/devtoolset/enable"
 printf 'ID=fedora\nVERSION_ID=44\n' >"$WORK/os-release"
+# Each image's /etc/os-release, as the real images have them.
+mkdir -p "$WORK/os-releases"
+printf 'ID="almalinux"\nVERSION_ID="10.2"\nPLATFORM_ID="platform:el10"\n' >"$WORK/os-releases/el10"
+printf 'ID=ubuntu\nVERSION_ID="24.04"\nID_LIKE=debian\n' >"$WORK/os-releases/ubuntu24"
+printf 'ID="amzn"\nVERSION_ID="2023"\nPLATFORM_ID="platform:al2023"\n' >"$WORK/os-releases/amzn2023"
+printf 'NAME="CentOS Linux"\nID="centos"\nVERSION_ID="7"\n' >"$WORK/os-releases/centos7"
 
 # ---- stubs -----------------------------------------------------------------------------------------------------------
 
@@ -94,8 +100,9 @@ export HS_BUILD_SLICE=stub.slice
 exec "$@"
 EOF
 # Runs the container's command on this host, with each mount's container path mapped back to its host path, the image's
-# glibc in STUB_IMAGE_GLIBC for the stub compilers, and the stub devtoolset in place of the dc image's. An image's id
-# is stubid-<its name>.
+# glibc in STUB_IMAGE_GLIBC for the stub compilers (STUB_FORCE_GLIBC overrides it in every image), the image's
+# os-release in place of /etc/os-release, and the stub devtoolset in place of the dc image's. An image's id is
+# stubid-<its name>.
 cat >"$STUBS/podman" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "${*//$'\n'/ }" >>"$STUB_LOG/podman"
@@ -119,14 +126,16 @@ while (($#)); do
   esac
 done
 case $1 in
-  stubid-*sun-container*) export STUB_IMAGE_GLIBC=2.39 ;;
-  stubid-*ubuntu2404) export STUB_IMAGE_GLIBC=2.39 ;;
-  stubid-*al2023) export STUB_IMAGE_GLIBC=2.34 ;;
-  stubid-*dc-build) export STUB_IMAGE_GLIBC=2.17 ;;
+  stubid-*sun-container*) export STUB_IMAGE_GLIBC=2.39 os=el10 ;;
+  stubid-*ubuntu2404) export STUB_IMAGE_GLIBC=2.39 os=ubuntu24 ;;
+  stubid-*al2023) export STUB_IMAGE_GLIBC=2.34 os=amzn2023 ;;
+  stubid-*dc-build) export STUB_IMAGE_GLIBC=2.17 os=centos7 ;;
   *) echo "stub podman: ran $1, not an inspected image id" >&2; exit 98 ;;
 esac
+[[ -z ${STUB_FORCE_GLIBC:-} ]] || STUB_IMAGE_GLIBC=$STUB_FORCE_GLIBC
 shift
 set -- "${@//\/opt\/rh\/devtoolset-11\/enable/$STUB_DEVTOOLSET_ENABLE}"
+set -- "${@//\/etc\/os-release/$STUB_OS_RELEASES/$os}"
 if [[ -n ${STUB_PODMAN_FAIL_VERSION:-} && ${*: -1} == --version ]]; then
   echo "stub podman: $1 cannot run in this image" >&2
   exit 126
@@ -211,6 +220,10 @@ anvilToml() {
 writeSource "$WORK/seed" c1 static
 g "$WORK/seed" add -A && g "$WORK/seed" commit -qm c1
 C1=$(g "$WORK/seed" rev-parse HEAD)
+# An anvil.toml from before the five targets.
+printf '[artifact.vcache]\nmajor = 1\nos = ["fedora44", "el10"]\n' >"$WORK/seed/anvil.toml"
+g "$WORK/seed" add -A && g "$WORK/seed" commit -qm c1b
+C1B=$(g "$WORK/seed" rev-parse HEAD)
 writeSource "$WORK/seed" c2 dynamic
 anvilToml 1 >"$WORK/seed/anvil.toml"
 g "$WORK/seed" add -A && g "$WORK/seed" commit -qm c2
@@ -248,7 +261,8 @@ runPublish() {
   mkdir -p "$WORK/logs/$name"
   touch "$WORK/logs/$name"/{anvil,podman,git,build-limited}
   STUB_LOG=$WORK/logs/$name PATH="$STUBS:$PATH" VCACHE_BUILD_LIMITED=$STUBS/build-limited \
-    STUB_DEVTOOLSET_ENABLE=$WORK/devtoolset/enable VCACHE_FEDORA44_INFRA=$WORK/infra.fedora44 \
+    STUB_DEVTOOLSET_ENABLE=$WORK/devtoolset/enable STUB_OS_RELEASES=$WORK/os-releases \
+    VCACHE_FEDORA44_INFRA=$WORK/infra.fedora44 \
     VCACHE_EL10_INFRA=$WORK/infra.el10 VCACHE_UBUNTU24_INFRA=$WORK/infra.ubuntu24 \
     VCACHE_AMZN2023_INFRA=$WORK/infra.amzn2023 VCACHE_OS_RELEASE=$WORK/os-release VCACHE_PUBLISH_ROOT=$WORK/builds \
     "$WORK/repo/scripts/anvil-publish.sh" "$@" >"$WORK/$name.out" 2>&1
@@ -302,9 +316,11 @@ for tag in fedora44 el10 ubuntu24 amzn2023 dc-build; do
   has "the build record names $tag's compiler, binutils, cmake and glibc" "$(cat "$WORK/tip.out")" \
     "^  $tag *cc: .*; ld: .*; as: .*; cmake: .*; glibc [0-9]"
 done
-for spec in fedora44:2.43 el10:2.39 ubuntu24:2.39 amzn2023:2.34 dc-build:2.17; do
-  has "the build record names the glibc ${spec%%:*} linked against and the versions it needs" "$(cat "$WORK/tip.out")" \
-    "^  ${spec%%:*} *linked against glibc ${spec#*:}; needs GLIBC_[0-9.]* (vcache), GLIBC_[0-9.]* (vcache-fstrace.so)$"
+for spec in fedora44:fedora44:2.43 el10:el10:2.39 ubuntu24:ubuntu24:2.39 amzn2023:amzn2023:2.34 dc-build:centos7:2.17; do
+  IFS=: read -r tag os glibc <<<"$spec"
+  has "the build record names the OS $tag was built on, the glibc it linked against and the versions it needs" \
+    "$(cat "$WORK/tip.out")" \
+    "^  $tag *built on $os, linked against glibc $glibc; needs GLIBC_[0-9.]* (vcache), GLIBC_[0-9.]* (vcache-fstrace.so)$"
 done
 check "the fedora44 build sees none of the caller's environment and a fixed PATH" \
   "$(sort -u "$WORK/fedora44-build-env.log")" "unset PATH=/usr/bin:/bin"
@@ -379,18 +395,36 @@ check "exits 8" "$?" 8
 has "says the publish is queued" "$(cat "$WORK/outbox.out")" 'queued the publish in its outbox'
 
 echo 'anvil-publish: a target built in another OS image'
-for spec in AMZN2023:localhost/fbg-dev:ubuntu2404:amzn2023:2.39:2.34 UBUNTU24:localhost/fbg-dev:al2023:ubuntu24:2.34:2.39 \
-  DC_BUILD:sun_container:el10:dc-build:2.39:2.17; do
-  IFS=: read -r name image_name image_tag tag built shipped <<<"$spec"
+# el10 and ubuntu24 both ship glibc 2.39: only the image's os-release tells them apart.
+for spec in EL10:localhost/fbg-dev:ubuntu2404:el10:ubuntu24 UBUNTU24:sun_container:el10:ubuntu24:el10 \
+  AMZN2023:localhost/fbg-dev:ubuntu2404:amzn2023:ubuntu24 UBUNTU24:localhost/fbg-dev:al2023:ubuntu24:amzn2023 \
+  DC_BUILD:sun_container:el10:dc-build:el10; do
+  IFS=: read -r name image_name image_tag tag built <<<"$spec"
+  case_name=wrong-$tag-in-$built
   (
     export "VCACHE_${name}_IMAGE=$image_name:$image_tag"
-    runPublish "wrong-$tag"
+    runPublish "$case_name"
   )
   check "$tag built in $image_name:$image_tag exits 1" "$?" 1
-  has "$tag built in $image_name:$image_tag: names the glibc it linked against" "$(cat "$WORK/wrong-$tag.out")" \
-    "$tag was linked against glibc $built, but $tag ships glibc $shipped"
-  check "$tag built in $image_name:$image_tag: publishes nothing" "$(log "wrong-$tag" anvil | wc -l)" 0
+  has "$tag built in $image_name:$image_tag: names the OS it was built on" "$(cat "$WORK/$case_name.out")" \
+    "$tag was built on $built (its build's /etc/os-release), not "
+  check "$tag built in $image_name:$image_tag: publishes nothing" "$(log "$case_name" anvil | wc -l)" 0
 done
+
+echo "anvil-publish: a toolchain linking against another glibc"
+STUB_FORCE_GLIBC=2.34 runPublish glibc
+check "exits 1" "$?" 1
+has "names the glibc and the OS" "$(cat "$WORK/glibc.out")" \
+  "el10 was linked against glibc 2.34, but el10 ships glibc 2.39"
+check "publishes nothing" "$(log glibc anvil | wc -l)" 0
+
+echo "anvil-publish: a commit whose anvil.toml lists other targets"
+runPublish oldtoml --commit "$C1B"
+check "exits 1" "$?" 1
+has "says what it lists and what is built" "$(cat "$WORK/oldtoml.out")" \
+  "anvil.toml lists os = \[el10 fedora44\]; this script builds amzn2023 dc-build el10 fedora44 ubuntu24"
+check "builds nothing" "$(log oldtoml build-limited | wc -l)" 0
+check "publishes nothing" "$(log oldtoml anvil | wc -l)" 0
 
 echo "anvil-publish: the repository's anvil.toml"
 check "lists the targets the script builds, in its order" \

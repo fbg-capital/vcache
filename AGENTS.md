@@ -243,14 +243,25 @@ origin's `fbg` tip: it builds every target from `git archive`, each through `bui
 | `amzn2023` | in `localhost/fbg-dev:al2023`, `/opt/infra.amzn2023` at `/opt/infra` | 2.34 |
 | `dc-build` | in `localhost/dc:build` (CentOS 7), its devtoolset-11 gcc | 2.17 |
 
-It checks that each target links libstdc++ statically, was linked against its OS's glibc
-(the table; a target built in another OS's image fails here), and runs `vcache --version`
+It refuses a commit whose `anvil.toml` lists other targets than these five, before any
+build. It checks that each target was built on its own OS (the build's `/etc/os-release`,
+read inside its image and named by anvil's tag rule; dc-build's is `centos7`, fedora44's
+the host's), so an image swapped for another OS's is refused even where both ship one
+glibc (el10 and ubuntu24); that its compiler linked against that OS's glibc (the table, a
+toolchain check); that it links libstdc++ statically; and that it runs `vcache --version`
 and loads its tracer where it runs: fedora44 on the host, every other target in its image.
 It prints the build record (commit, image digests, compilers, the ld, as, cmake and glibc
-each build saw, the newest glibc symbol version each file needs, file hashes), then sends
-all five targets in one `anvil publish`; anvil refuses a publish that misses one. Source
-paths are mapped to `.`, so a merge that leaves the binaries unchanged is reported as
-already published. A commit not on `origin/fbg`, or without `anvil.toml`, is refused.
+each build saw, the OS and glibc each target was built on, the newest glibc symbol version
+each file needs, file hashes), then sends all five targets in one `anvil publish`; once
+anvil's D23 server is deployed it refuses a publish that misses one. Source paths are
+mapped to `.`, so a merge that leaves the binaries unchanged is reported as already
+published. A commit not on `origin/fbg`, or without `anvil.toml`, is refused.
+
+The newest glibc symbol a target needs can be newer than its OS's glibc version, through
+the distribution's backports: the amzn2023 vcache needs `_dl_find_object@GLIBC_2.35`
+(static libgcc's unwinder), which Amazon Linux 2023 carries from glibc `2.34-216`; a host
+needs that package or newer (mvresearch1 and compass1 run `2.34-231`). The record lists
+each file's newest symbol; it is not a gate.
 `--dry-run` prints the steps and runs none of them; `--commit <sha>` publishes an earlier
 `fbg` commit. Raise `major` only when a change breaks how consumers call vcache.
 

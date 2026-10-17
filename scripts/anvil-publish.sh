@@ -21,12 +21,13 @@
 #
 # Each tree and devtoolset-11 ship libstdc++.a; a compiler without one makes vcache's Makefile link the C++ runtime
 # dynamically. Source paths are mapped to `.`, so a target's bytes depend on the source and the toolchain only, and
-# publishing a commit again is reported as already published. Before anything is published, each target must link
-# libstdc++ and libgcc statically, must have been linked against its OS's glibc (target_glibc below; a target built in
-# another OS's image fails here), and must run `vcache --version` and load its tracer where it runs: fedora44 on this
-# host, every other target in its image (el10 with the tree its entry point requires; none with a tree's libraries on
-# the library path). The build record (commit, image digests, toolchains, the compiler, ld, as, cmake and glibc each
-# build saw, the newest glibc symbol version each file needs, file hashes) is printed before the publish.
+# publishing a commit again is reported as already published. The commit's anvil.toml must list exactly these targets.
+# Before anything is published, each target must have been built on its OS (the build's /etc/os-release, by anvil's tag
+# rule, names target_os below), linked against that OS's glibc (target_glibc), link libstdc++ and libgcc statically, and
+# run `vcache --version` and load its tracer where it runs: fedora44 on this host, every other target in its image (el10
+# with the tree its entry point requires; none with a tree's libraries on the library path). The build record (commit,
+# image digests, toolchains, the compiler, ld, as, cmake and glibc each build saw, the newest glibc symbol version each
+# file needs, file hashes) is printed before the publish.
 #
 # Environment:
 #   ANVIL                  the anvil binary (default: anvil on PATH)
@@ -48,8 +49,10 @@ os_release=${VCACHE_OS_RELEASE:-/etc/os-release}
 build_jobs=8
 branch=fbg
 targets=(fedora44 el10 ubuntu24 amzn2023 dc-build)
-# The glibc each target's OS release ships. A release never moves to another glibc, so a build that saw any other one
-# ran in the wrong image.
+# The OS each target is built and run on, as anvil's tag rule names it; dc-build is the dc container's CentOS 7.
+declare -A target_os=([fedora44]=fedora44 [el10]=el10 [ubuntu24]=ubuntu24 [amzn2023]=amzn2023 [dc-build]=centos7)
+# The glibc each of those OS releases ships, which the build's compiler must link against; a release keeps its glibc
+# version (fixes are backported), so any other means the toolchain is not that OS's.
 declare -A target_glibc=([fedora44]=2.43 [el10]=2.39 [ubuntu24]=2.39 [amzn2023]=2.34 [dc-build]=2.17)
 declare -A target_image=(
   [el10]=${VCACHE_EL10_IMAGE:-sun_container:el10}
@@ -137,15 +140,27 @@ resolveCommit() {
   tip=$(git -C "$repo" rev-parse --verify "refs/remotes/origin/$branch^{commit}")
   if [[ -z $commit_arg ]]; then
     commit=$tip
-    return 0
+  else
+    commit=$(git -C "$repo" rev-parse --verify --quiet --end-of-options "$commit_arg^{commit}") ||
+      die "no commit $commit_arg in $repo, even after fetching origin"
+    git -C "$repo" merge-base --is-ancestor "$commit" "$tip" ||
+      die "$commit is not on origin/$branch; vcache:1 is what every consumer build runs, so only merged commits are published"
   fi
-  commit=$(git -C "$repo" rev-parse --verify --quiet --end-of-options "$commit_arg^{commit}") ||
-    die "no commit $commit_arg in $repo, even after fetching origin"
-  git -C "$repo" merge-base --is-ancestor "$commit" "$tip" ||
-    die "$commit is not on origin/$branch; vcache:1 is what every consumer build runs, so only merged commits are published"
   # The major comes from the commit itself, never from a working tree.
   git -C "$repo" cat-file -e "$commit:anvil.toml" 2>/dev/null ||
     die "${commit:0:12} has no anvil.toml, so it names no major; publish a commit that carries it"
+  checkTomlTargets
+}
+
+# The commit's anvil.toml requires the targets anvil checks a publish against: they must be the ones built here, or the
+# publish is refused after every build has run.
+checkTomlTargets() {
+  local listed built
+  listed=$(git -C "$repo" show "$commit:anvil.toml" | sed -n 's/^os *= *\[\(.*\)\] *$/\1/p' | tr ',' '\n' |
+    tr -d '" ' | sed '/^$/d' | sort | paste -sd' ')
+  built=$(printf '%s\n' "${targets[@]}" | sort | paste -sd' ')
+  [[ $listed == "$built" ]] ||
+    die "${commit:0:12}'s anvil.toml lists os = [${listed:-none on one line}]; this script builds $built"
 }
 
 # getNewestGcc <tree>: the highest N of the tree's bin/gcc-N.
@@ -255,6 +270,12 @@ glibc_probe='printf "#include <features.h>\n" | $CC -dM -E -x c - |
   awk '\''$2 == "__GLIBC__" { major = $3 } $2 == "__GLIBC_MINOR__" { minor = $3 } END { print major "." minor }'\'' \
   >vcache-build-glibc'
 
+# Writes the build environment's OS tag by anvil's rule (devtools scripts/infra-os-tag.sh) to vcache-build-os.
+# shellcheck disable=SC2016 # runs in the build's environment
+os_probe='(. /etc/os-release
+  if [[ ${PLATFORM_ID-} =~ ^platform:el([0-9]+)$ ]]; then echo "el${BASH_REMATCH[1]}"; else echo "$ID${VERSION_ID%%.*}"; fi
+  ) >vcache-build-os'
+
 buildTarget() {
   local tag=$1
   if [[ $tag == fedora44 ]]; then
@@ -266,7 +287,11 @@ buildTarget() {
   fi
   exportSource "$work/$tag"
   [[ $tag != fedora44 ]] || run mkdir -p -- "$work/home"
-  setBuildCommand "$tag" "./third-party/fetch.sh && make -j$build_jobs all && $glibc_probe"
+  if [[ $tag == fedora44 ]]; then
+    setBuildCommand "$tag" "./third-party/fetch.sh && make -j$build_jobs all && $glibc_probe"
+  else
+    setBuildCommand "$tag" "$os_probe && ./third-party/fetch.sh && make -j$build_jobs all && $glibc_probe"
+  fi
   run "$build_limited" "${build_command[@]}"
 }
 
@@ -319,12 +344,30 @@ checkNeeded() {
   fi
 }
 
-# checkGlibc <tag>: the build linked against the glibc of the target's OS.
+# getBuildOs <tag>: the OS tag the target's build ran on: this host's for fedora44, else what its image's
+# /etc/os-release names.
+getBuildOs() {
+  if [[ $1 == fedora44 ]]; then
+    printf '%s\n' "$host_tag"
+  else
+    cat -- "$work/$1/vcache-build-os" 2>/dev/null || true
+  fi
+}
+
+# checkBuildOs <tag>: the target was built on its own OS, not in another OS's image.
+checkBuildOs() {
+  local tag=$1 built
+  built=$(getBuildOs "$tag")
+  [[ $built == "${target_os[$tag]}" ]] ||
+    die "$tag was built on ${built:-an unknown OS} (its build's /etc/os-release), not ${target_os[$tag]}; check its image"
+}
+
+# checkGlibc <tag>: the build's compiler linked against the glibc of the target's OS.
 checkGlibc() {
   local tag=$1 built
   built=$(cat -- "$work/$tag/vcache-build-glibc" 2>/dev/null || true)
   [[ $built == "${target_glibc[$tag]}" ]] ||
-    die "$tag was linked against glibc ${built:-unknown}, but $tag ships glibc ${target_glibc[$tag]}; it was built in another OS's image"
+    die "$tag was linked against glibc ${built:-unknown}, but ${target_os[$tag]} ships glibc ${target_glibc[$tag]}; its toolchain is not ${target_os[$tag]}'s"
 }
 
 # checkRuns <tag>: every library resolves where the target runs, vcache answers --version, and its tracer loads with
@@ -346,12 +389,13 @@ checkRuns() {
 
 checkTargets() {
   local tag file where
-  step "check each target holds its C++ runtime, was linked against its OS's glibc, and runs where it will run"
+  step "check each target was built on its OS against its glibc, holds its C++ runtime, and runs where it will run"
   for tag in "${targets[@]}"; do
+    check "$tag was built on ${target_os[$tag]}" checkBuildOs "$tag"
+    check "$tag was linked against glibc ${target_glibc[$tag]}" checkGlibc "$tag"
     for file in vcache vcache-fstrace.so; do
       check "readelf -d $out/$tag/$file names no libstdc++ or libgcc_s" checkNeeded "$out/$tag/$file"
     done
-    check "$tag was linked against glibc ${target_glibc[$tag]}" checkGlibc "$tag"
   done
   for tag in "${targets[@]}"; do
     case $tag in
@@ -393,8 +437,8 @@ printRecord() {
     printf '  %-8s  %s\n' "$tag" "$tools"
   done
   for tag in "${targets[@]}"; do
-    printf '  %-8s  linked against glibc %s; needs GLIBC_%s (vcache), GLIBC_%s (vcache-fstrace.so)\n' "$tag" \
-      "$(cat -- "$work/$tag/vcache-build-glibc")" "$(getNeededGlibc "$out/$tag/vcache")" \
+    printf '  %-8s  built on %s, linked against glibc %s; needs GLIBC_%s (vcache), GLIBC_%s (vcache-fstrace.so)\n' \
+      "$tag" "$(getBuildOs "$tag")" "$(cat -- "$work/$tag/vcache-build-glibc")" "$(getNeededGlibc "$out/$tag/vcache")" \
       "$(getNeededGlibc "$out/$tag/vcache-fstrace.so")"
   done
   for tag in "${targets[@]}"; do
