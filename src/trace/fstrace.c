@@ -118,13 +118,14 @@ static int fsize_limit_seen;
 
 /* The pid holding the window (lift, write, restore), or 0. The limit is
    process-wide: a second thread lifting inside the window would read the
-   lifted value as the program's and restore that. fork() waits for it (see
-   fsize_before_fork). A child that a raw clone made inside a window finds its
-   parent's pid at its first record and takes the lock over; in a new PID
-   namespace its pid can equal the holder's, and it waits out the bound instead.
-   A CLONE_VM child that is not a thread can take it over too and break the
-   exclusion: a vfork child making hooked calls before exec, which POSIX leaves
-   undefined and glibc's posix_spawn child never does. */
+   lifted value as the program's and restore that. A fork() child puts the
+   program's limit back from an atfork handler (see fsize_before_fork). A child
+   that a raw clone made inside a window finds its parent's pid at its first
+   record and takes the lock over; in a new PID namespace its pid can equal the
+   holder's, and it waits out the bound instead. A CLONE_VM child that is not a
+   thread can take it over too and break the exclusion: a vfork child making
+   hooked calls before exec, which POSIX leaves undefined and glibc's
+   posix_spawn child never does. */
 static int fsize_lock;
 
 /* The open window, for a child that takes it over: the program's limit, and
@@ -218,47 +219,61 @@ static void fsize_lock_release(int self_pid) {
   __atomic_compare_exchange_n(&fsize_lock, &holder, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
 
-/* fork() copies the limits and the memory at different moments, while other
-   threads run, so a child of a fork inside a window can hold the lifted limit
-   with a memory that already says the window closed. So the forking thread
-   takes the lock (signals blocked, as in a window) and fork never overlaps a
-   window. When the wait runs out, the child closes a window it finds open. */
-static int fsize_fork_owns_lock;
-static int fsize_fork_blocked_signals;
-static struct kernel_sigset fsize_fork_program_mask;
+/* fork() copies the limits and the memory at different moments while other
+   threads run, so a child made during a window can hold the lifted limit with
+   a memory that already says the window closed. So fork's prepare step reads
+   the program's limit under the lock, when no window has it lifted, and the
+   child puts back that limit if its own copy is the lifted form of it. The
+   lock is held only for that read: held across fork it would invert with
+   glibc's atfork lock, which a thread holds with signals open while its
+   handler records. A concurrent fork may store its own reading, which is the
+   program's limit too. */
+static int fsize_fork_program_limit_known;
+static struct rlimit64 fsize_fork_program_limit;
+
+static void fsize_store_fork_program_limit(const struct rlimit64 *program_limit) {
+  if (program_limit != NULL) store_rlimit(&fsize_fork_program_limit, program_limit);
+  __atomic_store_n(&fsize_fork_program_limit_known, program_limit != NULL, __ATOMIC_RELEASE);
+}
 
 static void fsize_before_fork(void) {
+  struct rlimit64 program_limit;
+  if (!__atomic_load_n(&fsize_limit_seen, __ATOMIC_SEQ_CST)) {
+    int is_read = prlimit_fsize(NULL, &program_limit) == 0;
+    if (!__atomic_load_n(&fsize_limit_seen, __ATOMIC_SEQ_CST)) {
+      fsize_store_fork_program_limit(is_read ? &program_limit : NULL);
+      return;
+    }
+  }
   struct kernel_sigset all_signals, program_mask;
   memset(&all_signals, 0xff, sizeof all_signals);
   memset(&program_mask, 0, sizeof program_mask);
-  int blocked = syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all_signals, &program_mask,
-                        VCACHE_KERNEL_SIGSET_BYTES) == 0;
-  int owns_lock = fsize_lock_acquire((int)syscall(SYS_getpid));
-  fsize_fork_owns_lock = owns_lock;
-  fsize_fork_blocked_signals = blocked;
-  fsize_fork_program_mask = program_mask;
-}
-
-static void fsize_restore_fork_mask(int blocked, const struct kernel_sigset *program_mask) {
-  if (blocked) {
-    syscall(SYS_rt_sigprocmask, SIG_SETMASK, program_mask, NULL, VCACHE_KERNEL_SIGSET_BYTES);
+  const int has_blocked_signals =
+      syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all_signals, &program_mask,
+              VCACHE_KERNEL_SIGSET_BYTES) == 0;
+  const int self_pid = (int)syscall(SYS_getpid);
+  const int owns_lock = fsize_lock_acquire(self_pid);
+  const int is_read = owns_lock && prlimit_fsize(NULL, &program_limit) == 0;
+  fsize_store_fork_program_limit(is_read ? &program_limit : NULL);
+  if (owns_lock) fsize_lock_release(self_pid);
+  if (has_blocked_signals) {
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &program_mask, NULL, VCACHE_KERNEL_SIGSET_BYTES);
   }
-}
-
-static void fsize_after_fork_in_parent(void) {
-  const int owns_lock = fsize_fork_owns_lock;
-  const int blocked = fsize_fork_blocked_signals;
-  const struct kernel_sigset program_mask = fsize_fork_program_mask;
-  if (owns_lock) fsize_lock_release((int)syscall(SYS_getpid));
-  fsize_restore_fork_mask(blocked, &program_mask);
 }
 
 static void fsize_after_fork_in_child(void) {
-  if (!fsize_fork_owns_lock && __atomic_load_n(&fsize_lock, __ATOMIC_ACQUIRE) != 0) {
+  struct rlimit64 now;
+  if (__atomic_load_n(&fsize_fork_program_limit_known, __ATOMIC_ACQUIRE)) {
+    const struct rlimit64 program_limit = load_rlimit(&fsize_fork_program_limit);
+    if (program_limit.rlim_cur < program_limit.rlim_max && prlimit_fsize(NULL, &now) == 0 &&
+        now.rlim_cur == program_limit.rlim_max && now.rlim_max == program_limit.rlim_max) {
+      prlimit_fsize(&program_limit, NULL);
+    }
+  } else if (__atomic_load_n(&fsize_lock, __ATOMIC_ACQUIRE) != 0) {
     fsize_take_over_window();
   }
+  __atomic_store_n(&fsize_window_open, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&fsize_lock, 0, __ATOMIC_RELEASE);
-  fsize_restore_fork_mask(fsize_fork_blocked_signals, &fsize_fork_program_mask);
 }
 
 /* Room under `limit` for `n` more bytes and the margin; an unknown size counts
@@ -311,9 +326,10 @@ static int append_record(const char *buf, size_t n) {
   struct kernel_sigset all_signals, program_mask;
   memset(&all_signals, 0xff, sizeof all_signals);
   memset(&program_mask, 0, sizeof program_mask);
-  const struct kernel_sigset *blocked_from =
+  const int has_blocked_signals =
       syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all_signals, &program_mask,
-              VCACHE_KERNEL_SIGSET_BYTES) == 0 ? &program_mask : NULL;
+              VCACHE_KERNEL_SIGSET_BYTES) == 0;
+  const struct kernel_sigset *blocked_from = has_blocked_signals ? &program_mask : NULL;
   int self_pid = (int)syscall(SYS_getpid);
   int owns_lock = fsize_lock_acquire(self_pid);
   int written = 0;
@@ -344,7 +360,7 @@ static int append_record(const char *buf, size_t n) {
     __atomic_store_n(&fsize_window_open, 0, __ATOMIC_RELEASE);
   }
   if (owns_lock) fsize_lock_release(self_pid);
-  if (blocked_from != NULL) {
+  if (has_blocked_signals) {
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &program_mask, NULL, VCACHE_KERNEL_SIGSET_BYTES);
   }
   return written;
@@ -610,7 +626,7 @@ static int announce_object(struct dl_phdr_info *info, size_t size, void *data) {
 }
 
 __attribute__((constructor)) static void announce_self(void) {
-  pthread_atfork(fsize_before_fork, fsize_after_fork_in_parent, fsize_after_fork_in_child);
+  pthread_atfork(fsize_before_fork, NULL, fsize_after_fork_in_child);
   char exe[4096];
   long n = syscall(SYS_readlinkat, AT_FDCWD, "/proc/self/exe", exe, sizeof exe - 1);
   if (n > 0) { exe[n] = '\0'; emit('P', exe); }

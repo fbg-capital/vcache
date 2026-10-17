@@ -4291,7 +4291,9 @@ check "and holds every thread's, child's and handler's record" \
 # child, which gets a copy of the lifted limit, puts it back at its first
 # record. The program's own syscall(), exported ahead of libc's, holds the
 # tracer's write of one record inside the window while a second thread forks:
-# for 20 ms after fork() is called, and until a raw clone has returned.
+# for 20 ms after fork() is called, and until a raw clone has returned. A fork
+# child's copy of memory must show that write finished, and fork() must not
+# have waited out the tracer's 1 s bound instead.
 cat > "$WORK/tracer-fsize/window_fork.c" <<'EOF'
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -4308,7 +4310,7 @@ cat > "$WORK/tracer-fsize/window_fork.c" <<'EOF'
 #include <time.h>
 #include <unistd.h>
 static long (*next_syscall)(long, ...);
-static int is_in_window, has_called_fork, has_forked, uses_raw_clone;
+static int is_in_window, has_called_fork, has_forked, has_written_held, uses_raw_clone;
 static struct rlimit tiny;
 static int has_tiny_limit(void) {
   struct rlimit now;
@@ -4332,6 +4334,9 @@ long syscall(long number, ...) {
       const struct timespec hold = {0, 20 * 1000 * 1000};
       next_syscall(SYS_nanosleep, &hold, NULL);
     }
+    long held_result = next_syscall(number, args[0], args[1], args[2], args[3], args[4], args[5]);
+    __atomic_store_n(&has_written_held, 1, __ATOMIC_SEQ_CST);
+    return held_result;
   }
   return next_syscall(number, args[0], args[1], args[2], args[3], args[4], args[5]);
 }
@@ -4339,15 +4344,22 @@ static void *fork_in_window(void *arg) {
   (void)arg;
   while (!__atomic_load_n(&is_in_window, __ATOMIC_SEQ_CST)) sched_yield();
   __atomic_store_n(&has_called_fork, 1, __ATOMIC_SEQ_CST);
+  struct timespec fork_start, fork_end;
+  clock_gettime(CLOCK_MONOTONIC, &fork_start);
   pid_t child = uses_raw_clone ? (pid_t)next_syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0) : fork();
   if (child == 0) {
     if (!uses_raw_clone && !has_tiny_limit()) _exit(2);
+    if (!uses_raw_clone && !__atomic_load_n(&has_written_held, __ATOMIC_SEQ_CST)) _exit(5);
     int fd = open("absent-forked", O_RDONLY);
     _exit(fd >= 0 ? 3 : has_tiny_limit() ? 0 : 4);
   }
+  clock_gettime(CLOCK_MONOTONIC, &fork_end);
   __atomic_store_n(&has_forked, 1, __ATOMIC_SEQ_CST);
+  long long fork_ms = (fork_end.tv_sec - fork_start.tv_sec) * 1000LL +
+                      (fork_end.tv_nsec - fork_start.tv_nsec) / 1000000;
   int status = -1;
   if (child > 0) waitpid(child, &status, 0);
+  if (fork_ms >= 500) return (void *)(intptr_t)6;
   return (void *)(intptr_t)(WIFEXITED(status) ? WEXITSTATUS(status) : 9);
 }
 int main(int argc, char **argv) {
@@ -4373,6 +4385,57 @@ for fsize_fork in fork raw; do
     LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./window_fork "$fsize_fork" )
   check "a $fsize_fork child made inside the window ends up with the program's limit" "$?" "0"
 done
+
+# Atfork handlers registered before the tracer's (here a DT_NEEDED library's)
+# run their prepare step after it, on the forking thread. The tracer must not
+# hold its lock across fork, or their records wait out its bound and are lost.
+cat > "$WORK/tracer-fsize/prepare.c" <<'EOF'
+#include <fcntl.h>
+#include <pthread.h>
+#include <unistd.h>
+static void open_in_prepare(void) {
+  int fd = open("absent-prepare", O_RDONLY);
+  if (fd >= 0) close(fd);
+}
+__attribute__((constructor)) static void register_prepare(void) {
+  pthread_atfork(open_in_prepare, NULL, NULL);
+}
+EOF
+cat > "$WORK/tracer-fsize/prepare_fork.c" <<'EOF'
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+int main(void) {
+  struct rlimit before;
+  if (getrlimit(RLIMIT_FSIZE, &before) != 0) return 10;
+  struct rlimit tiny = {8, before.rlim_max};
+  if (setrlimit(RLIMIT_FSIZE, &tiny) != 0) return 11;
+  if (open("absent-before-fork", O_RDONLY) >= 0) return 12;
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  pid_t child = fork();
+  if (child == 0) _exit(0);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  if (child < 0) return 13;
+  int status;
+  waitpid(child, &status, 0);
+  long long fork_ms = (end.tv_sec - start.tv_sec) * 1000LL + (end.tv_nsec - start.tv_nsec) / 1000000;
+  printf("%lld\n", fork_ms);
+  return fork_ms < 200 ? 0 : 14;
+}
+EOF
+gcc -fPIC -shared -pthread "$WORK/tracer-fsize/prepare.c" -o "$WORK/tracer-fsize/libprepare.so"
+gcc "$WORK/tracer-fsize/prepare_fork.c" -o "$WORK/tracer-fsize/prepare_fork" \
+  -L"$WORK/tracer-fsize" -Wl,--no-as-needed -lprepare -Wl,-rpath,"$WORK/tracer-fsize"
+( cd "$WORK/tracer-fsize" && VCACHE_TRACE_LOG="$WORK/tracer-fsize/prepare.trace" \
+  LD_PRELOAD="$TOP/bin/vcache-fstrace.so" ./prepare_fork ) >/dev/null
+check "an earlier atfork handler's record inside fork does not wait out the bound" "$?" "0"
+check "and is recorded in a complete trace" \
+  "$(fsize_trace_state prepare)/$(grep -c $'^M\t.*/absent-prepare$' "$WORK/tracer-fsize/prepare.trace")" \
+  "fine/1"
 
 if [[ "$(id -u)" != 0 ]]; then
   mkdir -p "$WORK/tracer-sealed"
