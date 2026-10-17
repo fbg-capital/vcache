@@ -1,0 +1,5 @@
+# vcache's artifact in the FBG artifact store (anvil). scripts/anvil-publish.sh builds every target from one commit
+# and publishes them together. No compiler axis: consumers run vcache, they do not link it.
+[artifact.vcache]
+major = 1
+os = ["fedora44", "el10"]
