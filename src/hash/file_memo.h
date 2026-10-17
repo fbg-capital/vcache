@@ -6,6 +6,8 @@
 // hundreds of megabytes that rarely change between builds. Hashing them in full
 // on every lookup dominated the cost of a hit, so their digests are remembered
 // under <cache_dir>/filehash, keyed by what stat(2) says about the file.
+// Supported local Linux filesystems share a bounded mapped table; other cases
+// retain individual memo files. See docs/file-digest-table.md for the protocol.
 #pragma once
 
 #include <cstddef>

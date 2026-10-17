@@ -14,6 +14,9 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 #include <cerrno>
 #include <climits>
@@ -64,6 +67,7 @@
 #include "daemon/client.h"
 #include "daemon/server.h"
 #include "hash/file_memo.h"
+#include "hash/file_memo_table.h"
 #include "hash/hasher.h"
 #include "hash/sha256.h"
 #include "rust/rust_compile.h"
@@ -5909,7 +5913,15 @@ void TestFileDigestMemo() {
   } guard{*scratch};
 
   const std::string memo_dir = hash::FileDigestMemoDir(*scratch);
-  auto memo_files = [&memo_dir]() { return util::ListFilesRecursive(memo_dir); };
+  // Exercise the legacy fallback even on hosts that support shared tables.
+  util::WriteFileAtomic(memo_dir + "/" + hash::file_memo::kTableName, "unsupported");
+  auto memo_files = [&memo_dir]() {
+    auto files = util::ListFilesRecursive(memo_dir);
+    std::erase_if(files, [](const auto& file) {
+      return util::BaseName(file.path) == hash::file_memo::kTableName;
+    });
+    return files;
+  };
   auto overwrite_memos = [&memo_files](const std::string& text) {
     for (const util::FileEntry& memo : memo_files()) util::WriteFileAtomic(memo.path, text);
   };
@@ -5962,6 +5974,176 @@ void TestFileDigestMemo() {
   disk.Trim();
   Check(!util::FileExists(stale_memo), "trim removes a memo older than 30 days");
   Check(util::FileExists(young_memo), "trim keeps a memo younger than 30 days");
+}
+
+void TestFileDigestTable() {
+#if defined(__linux__)
+  Section("hash::shared file digest table");
+  using namespace hash::file_memo;
+  using hash::kDigestHexLen;
+  auto scratch = util::MakeTempDir("vcache-filehash-table-");
+  Check(scratch.has_value(), "digest table scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+  const int64_t settled_now = util::NowUnixNs() + 60'000'000'000;
+  struct statfs filesystem {};
+  if (::statfs(scratch->c_str(), &filesystem) != 0 ||
+      (filesystem.f_type != 0xef53 && filesystem.f_type != 0x58465342 &&
+       filesystem.f_type != 0x9123683e && filesystem.f_type != 0x01021994)) {
+    std::printf("  SKIP shared mappings on unsupported scratch filesystem\n");
+    return;
+  }
+  const std::string input = *scratch + "/input";
+  const std::string memo_dir = *scratch + "/filehash";
+  const std::string table_path = memo_dir + "/" + kTableName;
+  const std::string original = hash::HashString("first");
+  util::WriteFileAtomic(input, "first");
+  auto lookup = [&](const std::string& directory) {
+    return hash::HashFileMemoizedAt(input, directory, settled_now).value_or("");
+  };
+  CheckEq(lookup(memo_dir), original, "table fill preserves the content digest");
+  Check(util::FileSize(table_path) == kTableBytes, "settled input creates the bounded table");
+  if (util::FileSize(table_path) != kTableBytes) return;
+  auto bytes = util::ReadFile(table_path).value();
+  size_t slot_offset = 0;
+  for (size_t index = 0; index < kSlotCount; ++index) {
+    TableSlot slot {};
+    const size_t offset = kHeaderBytes + index * sizeof(slot);
+    std::memcpy(&slot, bytes.data() + offset, sizeof(slot));
+    if (slot.state == kCommitted) slot_offset = offset;
+  }
+  Check(slot_offset != 0, "a complete entry is published");
+  if (!slot_offset) return;
+  TableSlot slot {};
+  std::memcpy(&slot, bytes.data() + slot_offset, sizeof(slot));
+  const std::string planted(kDigestHexLen, 'a');
+  std::memcpy(slot.digest, planted.data(), kDigestHexLen);
+  auto checksum = [](const TableSlot& entry) {
+    hash::Hasher hasher;
+    hasher.Update(&entry.identity, sizeof(entry.identity));
+    hasher.Update(entry.digest, sizeof(entry.digest));
+    return hasher.Hex();
+  };
+  const std::string planted_checksum = checksum(slot);
+  std::memcpy(slot.checksum, planted_checksum.data(), kDigestHexLen);
+  auto write_slot = [&](const std::string& path, const TableSlot& entry) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    const bool written = fd >= 0 &&
+        ::pwrite(fd, &entry, sizeof(entry), slot_offset) == sizeof(entry);
+    if (fd >= 0) ::close(fd);
+    return written;
+  };
+  Check(write_slot(table_path, slot), "test publishes a checksummed memo fixture");
+  CheckEq(lookup(memo_dir), planted, "warm lookup uses the shared memo");
+
+  auto damaged = [&](const std::string& name, const std::function<void(TableSlot&)>& mutate) {
+    const std::string directory = *scratch + "/" + name;
+    TableSlot damaged_slot = slot;
+    mutate(damaged_slot);
+    std::string damaged_bytes = bytes;
+    std::memcpy(damaged_bytes.data() + slot_offset, &damaged_slot, sizeof(damaged_slot));
+    util::WriteFileAtomic(directory + "/" + kTableName, damaged_bytes);
+    CheckEq(lookup(directory), original, name + " cannot return a stale digest");
+  };
+  damaged("reserved entry after writer death", [](auto& entry) { entry.state = kWriting; });
+  damaged("empty entry with leftover payload", [](auto& entry) { entry.state = kEmpty; });
+  damaged("unknown publication state", [](auto& entry) { entry.state = 99; });
+  damaged("torn checksum", [](auto& entry) { entry.checksum[0] ^= 1; });
+  damaged("torn digest", [](auto& entry) { entry.digest[0] = 'b'; });
+  damaged("different file identity", [&](auto& entry) {
+    ++entry.identity.inode;
+    const std::string changed_checksum = checksum(entry);
+    std::memcpy(entry.checksum, changed_checksum.data(), kDigestHexLen);
+  });
+
+  for (const std::string damage : {"truncated", "version", "layout", "full"}) {
+    std::string damaged_bytes = bytes;
+    std::memcpy(damaged_bytes.data() + slot_offset, &slot, sizeof(slot));
+    if (damage == "truncated") damaged_bytes.resize(slot_offset + sizeof(slot) - 1);
+    if (damage == "version") damaged_bytes[offsetof(TableHeader, version)] ^= 1;
+    if (damage == "layout") damaged_bytes[offsetof(TableHeader, slot_bytes)] ^= 1;
+    if (damage == "full") {
+      TableSlot reserved {};
+      reserved.state = kWriting;
+      for (size_t index = 0; index < kSlotCount; ++index) {
+        std::memcpy(damaged_bytes.data() + kHeaderBytes + index * sizeof(reserved),
+                    &reserved, sizeof(reserved));
+      }
+    }
+    const std::string directory = *scratch + "/" + damage;
+    util::WriteFileAtomic(directory + "/" + kTableName, damaged_bytes);
+    CheckEq(lookup(directory), original, damage + " table safely rehashes");
+    CheckEq(lookup(directory), original, damage + " table fallback remains usable");
+  }
+
+  CheckEq(hash::HashFileMemoized(input, memo_dir).value_or(""), original,
+          "unsettled identity cannot use even a previously published entry");
+  struct stat input_stat {};
+  ::stat(input.c_str(), &input_stat);
+  const struct timespec original_times[] = {input_stat.st_atim, input_stat.st_mtim};
+  const int input_fd = ::open(input.c_str(), O_WRONLY);
+  ::write(input_fd, "other", 5);
+  ::close(input_fd);
+  ::utimensat(AT_FDCWD, input.c_str(), original_times, 0);
+  CheckEq(lookup(memo_dir), hash::HashString("other"),
+          "same-size edit with restored mtime invalidates through ctime");
+  util::WriteFileAtomic(input, "third");
+  CheckEq(lookup(memo_dir), hash::HashString("third"),
+          "atomic input replacement invalidates through inode");
+
+  const std::string shared = *scratch + "/concurrent";
+  std::vector<std::string> inputs;
+  for (size_t index = 0; index < 32; ++index) {
+    inputs.push_back(*scratch + "/input-" + std::to_string(index));
+    util::WriteFileAtomic(inputs.back(), std::to_string(index));
+  }
+  std::vector<pid_t> children;
+  for (size_t index = 0; index < 8; ++index) {
+    const pid_t child = ::fork();
+    if (child == 0) {
+      bool matched = true;
+      for (size_t repeat = 0; repeat < 5; ++repeat) {
+        for (size_t file = 0; file < inputs.size(); ++file) {
+          matched &= hash::HashFileMemoizedAt(inputs[file], shared, settled_now) ==
+                     hash::HashString(std::to_string(file));
+        }
+      }
+      _exit(matched ? 0 : 1);
+    }
+    children.push_back(child);
+  }
+  bool children_ok = true;
+  for (pid_t child : children) {
+    int status = 0;
+    children_ok &= child > 0 && ::waitpid(child, &status, 0) == child &&
+                   WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  }
+  Check(children_ok, "concurrent processes publish and read identical digests");
+  Check(util::FileSize(shared + "/" + kTableName) == kTableBytes,
+        "concurrent creation retains the fixed table size");
+  std::atomic<bool> threads_ok{true};
+  std::vector<std::thread> threads;
+  for (size_t index = 0; index < 8; ++index) {
+    threads.emplace_back([&]() {
+      for (size_t file = 0; file < inputs.size(); ++file) {
+        if (hash::HashFileMemoizedAt(inputs[file], shared, settled_now) !=
+            hash::HashString(std::to_string(file))) threads_ok = false;
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  Check(threads_ok, "concurrent threads read the process-shared table");
+
+  // A trim removes the directory entry, never the inode held by a live mapping.
+  CheckEq(lookup(memo_dir), hash::HashString("third"), "mapping is warm before trim");
+  util::RemoveFile(table_path);
+  CheckEq(lookup(memo_dir), hash::HashString("third"), "live mapping survives table removal");
+  lookup(*scratch + "/other-store");
+  CheckEq(lookup(memo_dir), hash::HashString("third"), "new mapping recreates a trimmed table");
+#endif
 }
 
 void TestCxxManifestTrace() {
@@ -7293,6 +7475,11 @@ void TestMemoryEstimates() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "--file-memo-tests") {
+    TestFileDigestMemo();
+    TestFileDigestTable();
+    return g_fail == 0 ? 0 : 1;
+  }
   if (argc == 2 && std::string(argv[1]) == "--session-daemon-startup-probe") {
     SessionDaemon server;
     return g_fail == 0 ? 0 : 1;
@@ -7394,6 +7581,7 @@ int main(int argc, char** argv) {
   TestMemoryEstimates();
   TestRustcFingerprint();
   TestFileDigestMemo();
+  TestFileDigestTable();
   TestCxxManifest();
   TestCxxManifestTrace();
   TestCxxAbsentList();
