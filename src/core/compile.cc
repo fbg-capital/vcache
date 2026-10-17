@@ -1863,8 +1863,10 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
                    : BuildPreprocessCommand(parsed, roots, compiler_id);
   util::ProcOptions pp_options{
       .capture_stdout = true, .capture_stderr = true, .stdout_file = preprocessed};
-  if (pp_recording && !pp_recording->trace_log.empty()) {
+  if (!cold_recording && pp_recording && !pp_recording->trace_log.empty()) {
     pp_options.env.emplace_back("VCACHE_TRACE_LOG", pp_recording->trace_log);
+    pp_options.env.emplace_back("VCACHE_TRACE_FORMAT",
+                               PrepareTraceLog(pp_recording->trace_log) ? "mmap-v1" : "text");
     pp_options.env.emplace_back("LD_PRELOAD", pp_recording->tracer);
   }
   std::optional<util::ProcResult> pp;
@@ -2015,6 +2017,8 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   const std::string trace_log = manifest_tracer.empty() ? "" : *temp_dir + "/trace";
   if (!manifest_tracer.empty()) {
     compile_options.env.emplace_back("VCACHE_TRACE_LOG", trace_log);
+    compile_options.env.emplace_back("VCACHE_TRACE_FORMAT",
+                                    PrepareTraceLog(trace_log) ? "mmap-v1" : "text");
     compile_options.env.emplace_back("LD_PRELOAD", manifest_tracer);
   }
   if (session && config.daemon.admission && daemon::AncestorHoldsReservation()) {
