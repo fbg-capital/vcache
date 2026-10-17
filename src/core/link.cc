@@ -12,11 +12,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <optional>
+#include <set>
 
 #include "args/link_args.h"
 #include "core/compile.h"
 #include "core/cost.h"
+#include "core/depfile.h"
 #include "core/link_trace.h"
 #include "core/manifest.h"
 #include "core/stats.h"
@@ -35,7 +38,7 @@ namespace vcache::core {
 namespace {
 
 // Bumped independently of the compile key: the two never share entries.
-constexpr std::string_view kLinkKeyVersion = "vcache-link-v5";
+constexpr std::string_view kLinkKeyVersion = "vcache-link-v6";
 constexpr std::string_view kLinkManifestHeader = "vcache-linkmanifest-1";
 
 // How many remembered input-states one manifest holds, matching the dependency
@@ -197,7 +200,8 @@ std::vector<std::string> AllOutputs(const args::LinkArgs& parsed) {
 // that were never checked; a reflink shares the source's extents at the moment
 // of cloning, so hashing the clone checks exactly what is published.
 bool PlaceVerifiedClone(const std::string& stored, const std::string& digest,
-                        const std::string& output, bool executable) {
+                        const std::string& output, bool executable,
+                        const std::string* localized = nullptr) {
   const auto temp = util::CloneToTempBeside(stored, output);
   if (!temp) {
     VCACHE_LOG("link hit: cannot clone " + stored + " beside " + output + ": " +
@@ -210,6 +214,7 @@ bool PlaceVerifiedClone(const std::string& stored, const std::string& digest,
     return false;
   };
 
+  if (localized && !util::WriteFileAtomic(tmp_path, *localized, /*durable=*/false)) return fail();
   const auto clone_digest = hash::HashFile(tmp_path);
   if (!clone_digest || *clone_digest != digest) {
     VCACHE_LOG("link hit: stored output failed digest verification: " + stored);
@@ -250,9 +255,98 @@ bool LinkOutputDigestValid(const std::string& digest) {
          });
 }
 
+using LinkDepfiles = std::map<std::string, std::string>;
+
+bool SupportedLinkDepPath(const std::string& path) {
+  return !path.empty() && std::none_of(path.begin(), path.end(), [](unsigned char ch) {
+    return ch <= ' ' || ch == 127 || ch == '\\' || ch == ':' || ch == '#' || ch == '$';
+  });
+}
+
+bool SupportedLinkDepfile(const DepFile& dep, const std::string& output) {
+  if (!dep.env_deps.empty() || dep.rules.empty() ||
+      dep.rules.front().targets != std::vector<std::string>{output}) return false;
+  std::set<std::string> prerequisites(dep.rules.front().prerequisites.begin(),
+                                      dep.rules.front().prerequisites.end());
+  if (prerequisites.empty()) return false;
+  for (size_t i = 0; i < dep.rules.size(); ++i) {
+    const auto& rule = dep.rules[i];
+    if (i != 0 && (!rule.prerequisites.empty() || rule.targets.size() != 1 ||
+                  !prerequisites.contains(rule.targets.front()))) return false;
+    for (const auto& path : rule.targets) {
+      if (!SupportedLinkDepPath(path)) return false;
+    }
+    for (const auto& path : rule.prerequisites) {
+      if (!SupportedLinkDepPath(path)) return false;
+    }
+  }
+  return true;
+}
+
+bool ReadFreshLinkDepfiles(const args::LinkArgs& parsed, const RootMap& roots,
+                          const std::string& trace_log, const LinkTrace& trace,
+                          LinkDepfiles* local, LinkDepfiles* canonical) {
+  if (parsed.dependency_outputs.empty()) return true;
+  TraceRecords records;
+  if (!ReadTraceRecords(trace_log, &records)) return false;
+  // Linkers can emit spaces and backslashes without Make escaping. Checking
+  // only parsed tokens could accept a split or silently unescaped filename.
+  for (const auto* paths : {&records.reads, &records.tools, &records.loaded}) {
+    for (const auto& path : *paths) {
+      if (!SupportedLinkDepPath(path)) return false;
+    }
+  }
+  std::set<std::string> observed;
+  for (const auto* paths : {&trace.inputs, &trace.tools}) {
+    for (const auto& path : *paths) {
+      if (const auto real = util::RealPath(path)) observed.insert(*real);
+    }
+  }
+  for (const auto& path : parsed.dependency_outputs) {
+    const auto text = util::ReadFile(path);
+    auto dep = text ? ParseDepFile(*text) : std::nullopt;
+    if (!dep || !SupportedLinkDepfile(*dep, parsed.output)) return false;
+    for (const auto& input : dep->rules.front().prerequisites) {
+      const auto real = util::RealPath(input);
+      if (!real || !observed.contains(*real)) return false;
+      // A root alias or a parent component must not leave a checkout's real
+      // input behind as an apparently external, unremapped dependency.
+      if (input.front() == '/' && (roots.Covers(input) || roots.Covers(*real)) &&
+          roots.Canonicalize(input) != roots.Canonicalize(*real)) return false;
+    }
+    local->emplace(path, RenderDepFile(*dep));
+    RemapDepFile(&*dep, roots, MapDirection::kCanonicalize);
+    if (!SupportedLinkDepfile(*dep, roots.Canonicalize(parsed.output))) return false;
+    canonical->emplace(path, RenderDepFile(*dep));
+  }
+  return true;
+}
+
+bool ReadCachedLinkDepfiles(const storage::Blob& blob, const args::LinkArgs& parsed,
+                           const RootMap& roots, storage::DiskStorage* disk,
+                           LinkDepfiles* localized) {
+  for (const auto& path : parsed.dependency_outputs) {
+    const auto file = std::find_if(blob.files.begin(), blob.files.end(),
+                                   [&](const auto& f) { return f.name == path; });
+    if (file == blob.files.end() || !LinkOutputDigestValid(file->contents)) return false;
+    const auto stored = disk->GetFile(file->contents, kLinkOutputSuffix);
+    const auto text = stored ? util::ReadFile(*stored) : std::nullopt;
+    if (!text || hash::HashString(*text) != file->contents) return false;
+    auto dep = ParseDepFile(*text);
+    if (!dep || !SupportedLinkDepfile(*dep, roots.Canonicalize(parsed.output))) return false;
+    RemapDepFile(&*dep, roots, MapDirection::kLocalize);
+    if (!SupportedLinkDepfile(*dep, parsed.output)) return false;
+    const auto rendered = RenderDepFile(*dep);
+    VCACHE_LOG("link depfile: output=" + path + " canonical=" + file->contents +
+               " replay=" + hash::HashString(rendered));
+    localized->emplace(path, rendered);
+  }
+  return true;
+}
+
 bool MaterializeOutputs(const storage::Blob& blob,
                         const std::vector<std::string>& outputs,
-                        storage::DiskStorage* disk) {
+                        storage::DiskStorage* disk, const LinkDepfiles& depfiles) {
   if (!LinkOutputSetMatches(blob, outputs)) return false;
 
   for (const storage::BlobFile& f : blob.files) {
@@ -280,7 +374,14 @@ bool MaterializeOutputs(const storage::Blob& blob,
       VCACHE_LOG("link hit: stored output is gone: " + f.contents);
       return false;
     }
-    if (!PlaceVerifiedClone(*stored, f.contents, f.name, f.executable)) return false;
+    if (const auto dep = depfiles.find(f.name); dep != depfiles.end()) {
+      // These bytes were authenticated before localization; an eviction now
+      // cannot change the contents published to the caller.
+      if (!PlaceVerifiedClone(*stored, hash::HashString(dep->second), f.name, f.executable,
+                              &dep->second)) return false;
+    } else if (!PlaceVerifiedClone(*stored, f.contents, f.name, f.executable)) {
+      return false;
+    }
   }
   return true;
 }
@@ -311,11 +412,14 @@ struct LinkVerifyCandidate {
 
 }  // namespace
 
-std::optional<bool> LinkOutputsMatch(const std::vector<storage::BlobFile>& expected) {
+static std::optional<bool> MatchLinkOutputs(
+    const std::vector<storage::BlobFile>& expected, const LinkDepfiles& depfiles) {
   bool matches = true;
   bool readable = true;
   for (const storage::BlobFile& file : expected) {
-    const auto digest = hash::HashFile(file.name);
+    const auto dep = depfiles.find(file.name);
+    const auto digest = dep == depfiles.end() ? hash::HashFile(file.name)
+                                            : std::optional(hash::HashString(dep->second));
     struct stat metadata;
     const bool have_metadata = ::stat(file.name.c_str(), &metadata) == 0;
     const bool executable = have_metadata && (metadata.st_mode & S_IXUSR) != 0;
@@ -327,6 +431,10 @@ std::optional<bool> LinkOutputsMatch(const std::vector<storage::BlobFile>& expec
                " fresh_executable=" + (!have_metadata ? "?" : executable ? "1" : "0"));
   }
   return readable ? std::optional<bool>(matches) : std::nullopt;
+}
+
+std::optional<bool> LinkOutputsMatch(const std::vector<storage::BlobFile>& expected) {
+  return MatchLinkOutputs(expected, {});
 }
 
 int RunLink(const std::vector<std::string>& argv, const Config& config,
@@ -403,15 +511,22 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
         VCACHE_LOG("link: manifest entry matched but its result is gone");
         continue;
       }
+      LinkDepfiles localized;
+      if (!ReadCachedLinkDepfiles(blob, parsed, roots, &disk, &localized)) break;
       if (config.link_verify) {
         if (!LinkVerifyCandidateValid(blob, outputs, &disk)) break;
+        for (auto& file : blob.files) {
+          if (const auto dep = localized.find(file.name); dep != localized.end()) {
+            file.contents = hash::HashString(dep->second);
+          }
+        }
         verify_candidate = LinkVerifyCandidate{e.result_key, std::move(blob.files)};
         VCACHE_LOG("link verify: candidate=" + e.result_key + " pre_key=" + pre_key +
                    " compiler=" + driver_id.fingerprint + " command=" + util::Join(argv, " ") +
                    " roots=" + roots.DebugString());
         return false;
       }
-      if (!MaterializeOutputs(blob, outputs, &disk)) break;
+      if (!MaterializeOutputs(blob, outputs, &disk, localized)) break;
       if (!blob.stderr_text.empty()) {
         ::fputs(roots.LocalizeText(blob.stderr_text).c_str(), stderr);
       }
@@ -506,8 +621,13 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   const bool trace_parsed = !trace_incomplete &&
       ParseTraceLog(trace_log, outputs, util::CurrentDir(), &trace);
   const bool trace_usable = trace_parsed && !trace.tools.empty();
+  LinkDepfiles local_depfiles, canonical_depfiles;
+  const bool depfiles_usable = parsed.dependency_outputs.empty() ||
+      (trace_usable && ReadFreshLinkDepfiles(parsed, roots, trace_log, trace,
+                                            &local_depfiles, &canonical_depfiles));
   if (verify_candidate) {
-    const std::optional<bool> matches = LinkOutputsMatch(verify_candidate->files);
+    const std::optional<bool> matches = depfiles_usable
+        ? MatchLinkOutputs(verify_candidate->files, local_depfiles) : std::nullopt;
     const Counter counter = !matches || (*matches && !trace_usable)
                                 ? Counter::kLinkVerifyError
                                 : *matches ? Counter::kLinkVerified : Counter::kLinkMismatch;
@@ -536,6 +656,11 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     // not loaded -- a statically linked linker, or a hardened loader. Storing
     // an entry whose input set may be partial would be worse than not caching.
     RecordDecision(cache_dir, Reason::kUntracedLinker);
+    return 0;
+  }
+
+  if (!depfiles_usable) {
+    VCACHE_LOG("link: unsupported dependency file; not storing");
     return 0;
   }
 
@@ -597,7 +722,12 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
   out_blob.stderr_text = roots.CanonicalizeText(result.stderr_data);
   AppendCostMeta(&out_blob.meta, result.max_rss_kb, result.wall_ms);
   for (const std::string& path : outputs) {
-    auto digest = hash::HashFile(path);
+    std::string stored_path = path;
+    if (const auto dep = canonical_depfiles.find(path); dep != canonical_depfiles.end()) {
+      stored_path = *temp_dir + "/depfile";
+      if (!util::WriteFileAtomic(stored_path, dep->second, /*durable=*/false)) return 0;
+    }
+    auto digest = hash::HashFile(stored_path);
     if (!digest) {
       VCACHE_LOG("link: expected output was not produced: " + path);
       return 0;
@@ -605,7 +735,7 @@ int RunLink(const std::vector<std::string>& argv, const Config& config,
     // Content-addressed, so an output identical to one already stored costs
     // nothing to store again -- and the clone is a reflink where possible, so
     // it costs nothing in space either.
-    if (disk.PutFile(*digest, kLinkOutputSuffix, path) !=
+    if (disk.PutFile(*digest, kLinkOutputSuffix, stored_path) !=
         storage::DiskStorage::PutFileStatus::kStored) {
       VCACHE_LOG("link: could not stage output into the cache: " + path);
       return 0;
