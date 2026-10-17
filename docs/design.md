@@ -787,8 +787,12 @@ materialises the candidate into the caller's paths: fresh outputs, diagnostics
 and exit status are authoritative. Every declared output is compared, and only
 the normal complete-trace storage path may publish a replacement. A failed link
 or unreadable output is a verification error; an incomplete trace cannot certify
-equality or authorize repair. This changes neither the link key nor the manifest
-format. See [verification configuration](configuration.md#verifying-link-hits)
+equality or authorize repair. Dependency sidecars hold parsed rules with canonical
+paths. Replay authenticates those bytes before localizing them; verification
+snapshots the digest of that exact localized representation and compares fresh
+rules with the same layout normalization. Binary and map checks remain exact.
+Unsupported linker escaping or rules decline the whole cached link. Link key
+version 6 excludes old raw dependency sidecars; the manifest format is unchanged. See [verification configuration](configuration.md#verifying-link-hits)
 for counters, read-only/recache behavior and the cost of this opt-in mode.
 
 - **Linking is cached only on request** (`VCACHE_LINK_CACHE=1`, Linux only, traced
@@ -817,9 +821,10 @@ for counters, read-only/recache behavior and the cost of this opt-in mode.
   refuses a nonempty trace without a final newline, which may end in a partial
   path. The tracer retains its log name from startup so clearing the environment
   cannot prevent it from marking a later lost record.
-  C/C++ manifest keys use version 8 and link keys version 5 to exclude entries
-  recorded before these tracer fixes. The preprocessor key uses version 7 for
-  the corrected GCC PCH pragma path handling; Rust keys are unchanged.
+  C/C++ manifest keys version 9 and link keys version 6 retain invalidation of
+  entries recorded before these tracer fixes. The colon renderer repair also
+  invalidates old depfiles: C/C++ key version 8, dep-scan version 6, Rust result
+  version 6 and Rust manifest version 4.
 - **A probe that fails for a reason other than `ENOENT` records nothing.** The
   tracer records a successful open or probe as an input (`R`) and an `ENOENT`
   failure as an absence (`M`); `EACCES`, `ENOTDIR`, `ELOOP` and every other

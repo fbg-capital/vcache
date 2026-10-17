@@ -90,6 +90,7 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
     if ((a == "-Map" || a == "--Map" || a == "--dependency-file") &&
         i + 1 < r.argv.size()) {
       r.extra_outputs.push_back(r.argv[++i]);
+      if (a == "--dependency-file") r.dependency_outputs.push_back(r.extra_outputs.back());
       r.key_args.push_back(a);
       continue;
     }
@@ -98,11 +99,15 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
         util::StartsWith(a, "-Wl,-Map=") ||
         util::StartsWith(a, "-Wl,--Map=")) {
       r.extra_outputs.push_back(a.substr(a.find('=') + 1));
+      if (util::StartsWith(a, "--dependency-file=")) {
+        r.dependency_outputs.push_back(r.extra_outputs.back());
+      }
       r.key_args.push_back(a);
       continue;
     }
     if (util::StartsWith(a, "-Wl,--dependency-file=")) {
       r.extra_outputs.push_back(a.substr(a.find('=') + 1));
+      r.dependency_outputs.push_back(r.extra_outputs.back());
       r.key_args.push_back(a);
       continue;
     }
@@ -110,6 +115,9 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
         util::StartsWith(a, "-Wl,--Map,") ||
         util::StartsWith(a, "-Wl,--dependency-file,")) {
       r.extra_outputs.push_back(a.substr(a.find(',', 4) + 1));
+      if (util::StartsWith(a, "-Wl,--dependency-file,")) {
+        r.dependency_outputs.push_back(r.extra_outputs.back());
+      }
       r.key_args.push_back(a);
       continue;
     }
@@ -139,6 +147,9 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
         }
         r.key_args.push_back(r.argv[++i]);
         r.extra_outputs.push_back(r.argv[++i]);
+        if (forwarded == "--dependency-file") {
+          r.dependency_outputs.push_back(r.extra_outputs.back());
+        }
         r.key_args.push_back(r.extra_outputs.back());
         continue;
       }
@@ -146,6 +157,9 @@ LinkArgs ParseLink(const std::vector<std::string>& raw_argv) {
           util::StartsWith(forwarded, "--Map=") ||
           util::StartsWith(forwarded, "--dependency-file=")) {
         r.extra_outputs.push_back(forwarded.substr(forwarded.find('=') + 1));
+        if (util::StartsWith(forwarded, "--dependency-file=")) {
+          r.dependency_outputs.push_back(r.extra_outputs.back());
+        }
       }
       continue;
     }

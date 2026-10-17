@@ -268,7 +268,17 @@ that the input set is complete, vcache declines.
 `-Map`, the `-Wl,-Map=...` and `-Wl,-Map,...` forms, `-Xlinker -Map`, and the
 corresponding `--dependency-file` forms are captured as additional outputs and
 replayed, so a hit does not hand back the binary while the companion file
-silently fails to appear.
+silently fails to appear. Dependency files are parsed, stored with canonical
+root paths and localized to the destination checkout on a hit. Targets, ordered
+prerequisites and empty rules are retained. Layout is normalized to one line
+per rule. Binary and map outputs remain byte-for-byte copies.
+
+Linker dependency syntax is more limited than compiler dependency syntax.
+Paths containing whitespace, literal backslashes, colons, hashes or dollars
+are declined because supported linkers do not consistently escape them.
+Dependencies must resolve to traced inputs; unsupported rule shapes or ambiguous
+root spellings also decline the entire cached link. The successful fresh link
+and its original files are retained, without storing a partial result.
 
 Link outputs live content-addressed in the local disk cache and are verified
 against their recorded digest before every hit. S3 may carry the small manifest
@@ -285,7 +295,12 @@ hits against a fresh link. The equivalent TOML keys are `vcache.link_cache` and
 
 Verification validates the cached output set and sidecar checksums, then runs
 the real linker under the tracer. It compares every declared output, including
-map files, by content digest and recorded executable status. The build receives
+map files, by content digest and recorded executable status. Dependency files
+compare the localized replay rules against the fresh rules, preserving path
+spellings and order while ignoring line wrapping. Canonicalizing both sides
+would hide incorrect replay through a root alias, so verification does not do
+that. Unreadable or unsupported fresh depfiles are verification errors.
+The build receives
 the fresh outputs, diagnostics and exit status. Cached outputs are never placed
 before that link, and a failing fresh link never falls back to the cached binary.
 This costs a full link plus comparison, so it is an observation mode for a soak,

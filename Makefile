@@ -350,6 +350,7 @@ test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACE
 	@CXX="$(CXX)" CURL_CFLAGS="$(CURL_CFLAGS)" $(TOP)/tests/curl_abi_check.sh
 	@$(TOP)/tests/cctype_include_check.sh
 	@$(TOP)/tests/integration_test.sh
+	@PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/link_depfile_test.py $(BINDIR)/vcache
 	@bash $(TOP)/tests/link_verify_test.sh
 	@bash $(TOP)/tests/anvil_publish_test.sh
 	@PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/link_verify_worktrees_test.py

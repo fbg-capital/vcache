@@ -44,6 +44,7 @@ struct LinkArgs {
   // instance. They have to be captured and replayed, or a hit silently fails to
   // produce them.
   std::vector<std::string> extra_outputs;
+  std::vector<std::string> dependency_outputs;
 
   // Flags that affect the produced bytes, with paths left local; the caller
   // canonicalises them through the root map before hashing.
