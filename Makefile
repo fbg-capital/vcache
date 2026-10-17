@@ -141,6 +141,14 @@ PROBE_SRC := $(shell mktemp --suffix=.cc 2>/dev/null || echo /tmp/vcache-probe.c
 $(shell echo 'int main(){return 0;}' > $(PROBE_SRC))
 
 HAVE_GZ_ZSTD := $(shell $(CXX) -ggdb3 -gz=zstd -c $(PROBE_SRC) -o /dev/null >/dev/null 2>&1 && echo 1)
+HAVE_GZ_ZLIB := $(shell $(CXX) -ggdb3 -gz=zlib -c $(PROBE_SRC) -o /dev/null >/dev/null 2>&1 && echo 1)
+# --compress-debug-sections is GNU ld's, so ask the linker separately rather than infer it from the
+# compiler: on macOS the compile succeeds and the link would not, and binutils 2.41 as built for EL10
+# and AL2023 reads zstd sections but cannot write them.
+HAVE_LD_ZSTD := $(shell $(CXX) -Wl,--compress-debug-sections=zstd $(PROBE_SRC) -o /dev/null \
+                  >/dev/null 2>&1 && echo 1)
+HAVE_LD_ZLIB := $(shell $(CXX) -Wl,--compress-debug-sections=zlib $(PROBE_SRC) -o /dev/null \
+                  >/dev/null 2>&1 && echo 1)
 HAVE_LTO     := $(shell $(CXX) -flto=auto -O2 $(PROBE_SRC) -o /dev/null >/dev/null 2>&1 && echo 1)
 ifneq ($(HOST_OS),Darwin)
 HAVE_STATIC_RT := $(shell $(CXX) -static-libstdc++ -static-libgcc $(PROBE_SRC) -o /dev/null \
@@ -180,15 +188,18 @@ endif
   SECTIONS := -ffunction-sections -fdata-sections
 endif
 
-ifeq ($(HAVE_GZ_ZSTD),1)
-  # zstd compresses DWARF far better than zlib at similar cost, and -ggdb3
-  # produces a lot of DWARF.
+# zstd compresses DWARF far better than zlib at similar cost, and -ggdb3 produces a lot of DWARF.
+# A linker that cannot write zstd gets zlib for both: without the linker flag the binary's debug
+# sections come out uncompressed, about twice the size.
+ifeq ($(HAVE_GZ_ZSTD)$(HAVE_LD_ZSTD),11)
   DEBUG_FMT    := -gz=zstd
-  # The probe above only compiles. --compress-debug-sections is GNU ld's, so ask
-  # separately whether the linker takes it rather than infer it from the
-  # compiler: on macOS the compile succeeds and the link would not.
-  DEBUG_FMT_LD := $(shell $(CXX) -Wl,--compress-debug-sections=zstd $(PROBE_SRC) \
-                    -o /dev/null >/dev/null 2>&1 && echo -Wl,--compress-debug-sections=zstd)
+  DEBUG_FMT_LD := -Wl,--compress-debug-sections=zstd
+else ifeq ($(HAVE_GZ_ZLIB)$(HAVE_LD_ZLIB),11)
+  DEBUG_FMT    := -gz=zlib
+  DEBUG_FMT_LD := -Wl,--compress-debug-sections=zlib
+else ifeq ($(HAVE_GZ_ZSTD),1)
+  DEBUG_FMT    := -gz=zstd
+  DEBUG_FMT_LD :=
 else
   DEBUG_FMT    :=
   DEBUG_FMT_LD :=
