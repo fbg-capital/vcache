@@ -92,10 +92,16 @@ cat >"$STUBS/git" <<EOF
 printf '%s\n' "\$*" >>"\$STUB_LOG/git"
 exec $REAL_GIT "\$@"
 EOF
+# The real one runs the command through systemd-run, which substitutes ${...} in every argument, so a build script may
+# hold none but the slice the container joins (systemd and bash expand that one alike).
 cat >"$STUBS/build-limited" <<'EOF'
 #!/usr/bin/env bash
 # One line per call: the build scripts hold newlines.
 printf '%s\n' "${*//$'\n'/ }" >>"$STUB_LOG/build-limited"
+for arg; do
+  rest=${arg//'${HS_BUILD_SLICE:+--cgroup-parent="$HS_BUILD_SLICE"}'/}
+  [[ $rest != *'${'* ]] || { echo "stub build-limited: systemd-run would substitute \${...} in: $arg" >&2; exit 97; }
+done
 export HS_BUILD_SLICE=stub.slice
 exec "$@"
 EOF

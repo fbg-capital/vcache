@@ -270,11 +270,14 @@ glibc_probe='printf "#include <features.h>\n" | $CC -dM -E -x c - |
   awk '\''$2 == "__GLIBC__" { major = $3 } $2 == "__GLIBC_MINOR__" { minor = $3 } END { print major "." minor }'\'' \
   >vcache-build-glibc'
 
-# Writes the build environment's OS tag by anvil's rule (devtools scripts/infra-os-tag.sh) to vcache-build-os.
+# Writes the build environment's OS tag by anvil's rule (devtools scripts/infra-os-tag.sh) to vcache-build-os. Without
+# braced expansions: build-limited's systemd-run substitutes every ${...} in its arguments before bash sees them.
 # shellcheck disable=SC2016 # runs in the build's environment
 os_probe='(. /etc/os-release
-  if [[ ${PLATFORM_ID-} =~ ^platform:el([0-9]+)$ ]]; then echo "el${BASH_REMATCH[1]}"; else echo "$ID${VERSION_ID%%.*}"; fi
-  ) >vcache-build-os'
+  case $PLATFORM_ID in
+    platform:el[0-9]*) echo "el$(echo "$PLATFORM_ID" | sed s/^platform:el//)" ;;
+    *) echo "$ID$(echo "$VERSION_ID" | cut -d. -f1)" ;;
+  esac) >vcache-build-os'
 
 buildTarget() {
   local tag=$1
