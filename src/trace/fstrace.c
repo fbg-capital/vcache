@@ -221,30 +221,24 @@ static void fsize_lock_release(int self_pid) {
 
 /* fork() copies the limits and the memory at different moments while other
    threads run, so a child made during a window can hold the lifted limit with
-   a memory that already says the window closed. So fork's prepare step reads
-   the program's limit under the lock, when no window has it lifted, and the
-   child puts back that limit if its own copy is the lifted form of it. The
-   lock is held only for that read: held across fork it would invert with
+   a memory that already says the window closed; other threads' stores can
+   even be missing from it, so no window count or flag can confirm the lift.
+   The forking thread's own stores are always there. So fork's prepare step
+   reads the program's limit under the lock, when no window has it lifted, and
+   the child puts that limit back if its own copy is the lifted form of it. A
+   program thread that raises its soft limit to the hard one during the fork
+   leaves the child the limit from before, which is one outcome of that race.
+   The lock is held only for the read: held across fork it would invert with
    glibc's atfork lock, which a thread holds with signals open while its
-   handler records. A concurrent fork may store its own reading, which is the
-   program's limit too. */
+   handler records. The reading is a seqlock written under the lock, so a child
+   copied mid-write by a concurrent fork falls back to the window it finds. A
+   prepare whose wait ran out leaves the previous reading. */
+static unsigned fsize_fork_reading_seq;
 static int fsize_fork_program_limit_known;
 static struct rlimit64 fsize_fork_program_limit;
 
-static void fsize_store_fork_program_limit(const struct rlimit64 *program_limit) {
-  if (program_limit != NULL) store_rlimit(&fsize_fork_program_limit, program_limit);
-  __atomic_store_n(&fsize_fork_program_limit_known, program_limit != NULL, __ATOMIC_RELEASE);
-}
-
 static void fsize_before_fork(void) {
-  struct rlimit64 program_limit;
-  if (!__atomic_load_n(&fsize_limit_seen, __ATOMIC_SEQ_CST)) {
-    int is_read = prlimit_fsize(NULL, &program_limit) == 0;
-    if (!__atomic_load_n(&fsize_limit_seen, __ATOMIC_SEQ_CST)) {
-      fsize_store_fork_program_limit(is_read ? &program_limit : NULL);
-      return;
-    }
-  }
+  if (!__atomic_load_n(&fsize_limit_seen, __ATOMIC_SEQ_CST)) return;
   struct kernel_sigset all_signals, program_mask;
   memset(&all_signals, 0xff, sizeof all_signals);
   memset(&program_mask, 0, sizeof program_mask);
@@ -252,19 +246,33 @@ static void fsize_before_fork(void) {
       syscall(SYS_rt_sigprocmask, SIG_SETMASK, &all_signals, &program_mask,
               VCACHE_KERNEL_SIGSET_BYTES) == 0;
   const int self_pid = (int)syscall(SYS_getpid);
-  const int owns_lock = fsize_lock_acquire(self_pid);
-  const int is_read = owns_lock && prlimit_fsize(NULL, &program_limit) == 0;
-  fsize_store_fork_program_limit(is_read ? &program_limit : NULL);
-  if (owns_lock) fsize_lock_release(self_pid);
+  if (fsize_lock_acquire(self_pid)) {
+    struct rlimit64 program_limit;
+    const int is_read = prlimit_fsize(NULL, &program_limit) == 0;
+    __atomic_fetch_add(&fsize_fork_reading_seq, 1, __ATOMIC_SEQ_CST);
+    if (is_read) store_rlimit(&fsize_fork_program_limit, &program_limit);
+    __atomic_store_n(&fsize_fork_program_limit_known, is_read, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&fsize_fork_reading_seq, 1, __ATOMIC_SEQ_CST);
+    fsize_lock_release(self_pid);
+  }
   if (has_blocked_signals) {
     syscall(SYS_rt_sigprocmask, SIG_SETMASK, &program_mask, NULL, VCACHE_KERNEL_SIGSET_BYTES);
   }
 }
 
+/* 1 when the child's copy of memory holds a whole reading from a prepare. */
+static int fsize_load_fork_reading(struct rlimit64 *program_limit) {
+  const unsigned seq = __atomic_load_n(&fsize_fork_reading_seq, __ATOMIC_SEQ_CST);
+  if ((seq & 1) != 0 || !__atomic_load_n(&fsize_fork_program_limit_known, __ATOMIC_RELAXED)) {
+    return 0;
+  }
+  *program_limit = load_rlimit(&fsize_fork_program_limit);
+  return __atomic_load_n(&fsize_fork_reading_seq, __ATOMIC_SEQ_CST) == seq;
+}
+
 static void fsize_after_fork_in_child(void) {
-  struct rlimit64 now;
-  if (__atomic_load_n(&fsize_fork_program_limit_known, __ATOMIC_ACQUIRE)) {
-    const struct rlimit64 program_limit = load_rlimit(&fsize_fork_program_limit);
+  struct rlimit64 program_limit, now;
+  if (fsize_load_fork_reading(&program_limit)) {
     if (program_limit.rlim_cur < program_limit.rlim_max && prlimit_fsize(NULL, &now) == 0 &&
         now.rlim_cur == program_limit.rlim_max && now.rlim_max == program_limit.rlim_max) {
       prlimit_fsize(&program_limit, NULL);
