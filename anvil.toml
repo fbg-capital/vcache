@@ -2,4 +2,4 @@
 # and publishes them together. No compiler axis: consumers run vcache, they do not link it.
 [artifact.vcache]
 major = 1
-os = ["fedora44", "el10"]
+os = ["fedora44", "el10", "ubuntu24", "amzn2023", "dc-build"]

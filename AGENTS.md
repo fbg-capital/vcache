@@ -230,24 +230,47 @@ environment. Resolve compiler executable names there before running the tests.
 ### Publishing to anvil
 
 vcache is also the artifact `vcache` in the FBG artifact store, anvil (`anvil.toml`: major
-1, targets `fedora44` and `el10`). After every merge to `fbg`, run
-`scripts/anvil-publish.sh` from a checkout of this repository on a fedora44 host (zeus,
-until a builder host does it). It publishes origin's `fbg` tip: it builds both targets from
-`git archive`, fedora44 natively with `/opt/infra.fedora44`'s newest `gcc-N` under `env -i`
-(`PATH=/usr/bin:/bin` and only the variables the build needs) and el10 in `sun_container:el10`
-with `/opt/infra.el10`, all through `build-limited`. It checks that each
-target links libstdc++ statically and runs `vcache --version` and loads its tracer where it
-runs, prints the build record (commit, image digest, compilers, the ld, as, cmake and glibc
-each build saw, file hashes), then sends both targets in one `anvil publish`. Source paths
-are mapped to `.`, so a merge that leaves the binaries unchanged is reported as already
-published. A commit not on `origin/fbg`, or without `anvil.toml`, is refused. `--dry-run` prints the steps and runs
-none of them; `--commit <sha>` publishes an earlier `fbg` commit. Raise `major` only when a
-change breaks how consumers call vcache.
+1, one target per OS the consumers build on: `fedora44`, `el10`, `ubuntu24`, `amzn2023` and
+`dc-build`). After every merge to `fbg`, run `scripts/anvil-publish.sh` from a checkout of
+this repository on a fedora44 host (zeus, until a builder host does it). It publishes
+origin's `fbg` tip: it builds every target from `git archive`, each through `build-limited`:
+
+| Target | Built | glibc |
+|---|---|---|
+| `fedora44` | natively, `/opt/infra.fedora44`'s newest `gcc-N` under `env -i` (`PATH=/usr/bin:/bin` and only the variables the build needs) | 2.43 |
+| `el10` | in `sun_container:el10`, `/opt/infra.el10` at `/opt/infra` | 2.39 |
+| `ubuntu24` | in `localhost/fbg-dev:ubuntu2404`, `/opt/infra.ubuntu24` at `/opt/infra` | 2.39 |
+| `amzn2023` | in `localhost/fbg-dev:al2023`, `/opt/infra.amzn2023` at `/opt/infra` | 2.34 |
+| `dc-build` | in `localhost/dc:build` (CentOS 7), its devtoolset-11 gcc | 2.17 |
+
+It refuses a commit whose `anvil.toml` lists other targets than these five, before any
+build. It checks that each target was built on its own OS (the build's `/etc/os-release`,
+read inside its image and named by anvil's tag rule; dc-build's is `centos7`, fedora44's
+the host's), so an image swapped for another OS's is refused even where both ship one
+glibc (el10 and ubuntu24); that its compiler linked against that OS's glibc (the table, a
+toolchain check); that it links libstdc++ statically; and that it runs `vcache --version`
+and loads its tracer where it runs: fedora44 on the host, every other target in its image.
+It prints the build record (commit, image digests, compilers, the ld, as, cmake and glibc
+each build saw, the OS and glibc each target was built on, the newest glibc symbol version
+each file needs, file hashes), then sends all five targets in one `anvil publish`; once
+anvil's D23 server is deployed it refuses a publish that misses one. Source paths are
+mapped to `.`, so a merge that leaves the binaries unchanged is reported as already
+published. A commit not on `origin/fbg`, or without `anvil.toml`, is refused.
+
+The newest glibc symbol a target needs can be newer than its OS's glibc version, through
+the distribution's backports: the amzn2023 vcache needs `_dl_find_object@GLIBC_2.35`
+(static libgcc's unwinder), which Amazon Linux 2023 carries from glibc `2.34-216`; a host
+needs that package or newer (mvresearch1 and compass1 run `2.34-231`). The record lists
+each file's newest symbol; it is not a gate.
+`--dry-run` prints the steps and runs none of them; `--commit <sha>` publishes an earlier
+`fbg` commit. Raise `major` only when a change breaks how consumers call vcache.
 
 It needs `anvil` on `PATH` with `~/.fbg/anvil.env` holding a token that may publish
-`vcache` (on zeus the `anvil-tunnel` service reaches the server), `podman` with
-`sun_container:el10`, and both toolchain trees. Exit 8 means the server was unreachable and
-the publish waits in anvil's outbox; the next `anvil` command sends it.
+`vcache` (on zeus the `anvil-tunnel` service reaches the server), `podman` with the four
+images (host_setup builds the `fbg-dev` ones: `ansible/bin/build-image ubuntu2404|al2023`),
+and the four toolchain trees (devtools `3rdparty/build-os.sh <tag>`). Exit 8 means the
+server was unreachable and the publish waits in anvil's outbox; the next `anvil` command
+sends it.
 
 ## Gotchas
 
