@@ -108,6 +108,12 @@ not a guaranteed whole-build wall-time improvement. Host's smallest input was
 slightly slower. Individual wall-time p95 improved for the PCH cases (host
 7.998 → 7.681 ms; EL10 22.283 → 17.459 ms), but not every input.
 
+Aggregate median client user CPU was 0.977 → 1.008 seconds on host and
+0.940 → 0.888 seconds on EL10. Median daemon user/system CPU was
+0.180/0.310 → 0.160/0.270 seconds on host and 0.120/0.200 → 0.110/0.210 seconds
+on EL10. Concurrent aggregate hits exercised shared-table reads without adding
+a daemon bottleneck; the table performs no IPC or locking on those reads.
+
 Each table allocates approximately 3 MiB on disk and shares those mapped pages
 between clients. Separate process-memory samples showed roughly 50 additional
 minor faults per invocation, no major faults, and peak RSS of 10.0–11.1 MiB on host
@@ -135,5 +141,9 @@ are retained under `/build/richard/codex-1000/vcache-83w/`, especially
 `host-measurements-final/`, `el10-measurements-final/`, `summary.json`,
 `mutations-final.log` and `gate-final.log`. These warm-hit measurements precede
 the subsequent tracer fixes merged from `origin/fbg`; warm manifest hits do not
-run the compiler or tracer. The combined revision is checked separately before
-publication.
+run the compiler or tracer. The combined revision's full gate also passed:
+1,500 unit, 1,341 integration, 93 link-verification and 93 Anvil checks, plus
+the ancillary suites (`gate-integrated.log`). A separate binary/tracer regression
+fails table creation on the old binary and passes on the combined development
+build, including restored-mtime edits, file replacement, unsettled writes,
+corrupt digests and truncation between processes.
