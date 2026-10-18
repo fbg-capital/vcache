@@ -104,15 +104,18 @@ def main():
     counts = {}
     for _rel, (_entry, headers, pch) in by_rel.items():
         for header in headers:
-            if header.startswith("/"):
+            if not header.endswith(".h"):
                 continue
             counts.setdefault(header, [0, 0])
             counts[header][1 if pch else 0] += 1
+    best = None
     for header, (non, pch) in counts.items():
-        if pch == 0 and non >= 1:
-            non_pch_header = header
-            non_pch_set = [entry for rel, (entry, headers, _p) in by_rel.items() if header in headers]
-            break
+        if pch == 0 and non >= 1 and (best is None or non > best[0]):
+            best = (non, header)
+    if best:
+        non_pch_header = best[1]
+        non_pch_set = [entry for _rel, (entry, headers, _p) in by_rel.items()
+                       if non_pch_header in headers]
     ensemble = [entry for _r, (entry, headers, _p) in by_rel.items()
                 if "sunbird/ensemble/EnsembleSnapshot.h" in headers]
     epoll = [entry for _r, (entry, headers, _p) in by_rel.items()
