@@ -1851,8 +1851,13 @@ void SignalReady(int* ready_fd, char code, const std::string& message) {
   if (*ready_fd < 0) return;
   std::string payload(1, code);
   payload += message;
-  ssize_t ignored = ::write(*ready_fd, payload.data(), payload.size());
-  (void)ignored;
+  size_t written = 0;
+  while (written < payload.size()) {
+    const ssize_t result = ::write(*ready_fd, payload.data() + written, payload.size() - written);
+    if (result < 0 && errno == EINTR) continue;
+    if (result <= 0) break;
+    written += static_cast<size_t>(result);
+  }
   ::close(*ready_fd);
   *ready_fd = -1;
 }
