@@ -85,46 +85,42 @@ std::string NormalizeLinemarker(const std::string& line, const RootMap& roots) {
   return out;
 }
 
-bool HashNormalizedPreprocessedOutput(const std::string& path,
-                                      const RootMap& roots,
-                                      hash::Hasher* hasher,
-                                      bool* saw_incbin, hash::Hasher* also,
-                                      std::vector<std::string>* pch_paths) {
-  if (saw_incbin != nullptr) *saw_incbin = false;
-  const auto update = [&](std::string_view text) {
+struct NormalizedPreprocessHash::Impl {
+  const RootMap* roots = nullptr;
+  hash::Hasher* hasher = nullptr;
+  bool* saw_incbin = nullptr;
+  hash::Hasher* also = nullptr;
+  std::vector<std::string>* pch_paths = nullptr;
+  std::string pending;
+  std::string hash_batch;
+  bool ok = true;
+
+  void Update(std::string_view text) {
     hasher->Update(text);
     if (also != nullptr) also->Update(text);
-  };
-  FILE* f = ::fopen(path.c_str(), "rb");
-  if (f == nullptr) return false;
-
-  std::vector<char> buf(1 << 20);
-  std::string pending;  // partial trailing line carried between reads
-  bool ok = true;
+  }
 
   // BLAKE3 hashes several chunks at once with SIMD only when one update spans
   // them; fed a run or a linemarker at a time (about 1 KiB apart in real
   // output) it compresses block by block at a fraction of the speed. The
   // digest of a stream does not depend on how it is sliced, so the normalised
   // text is gathered here and handed over in large pieces.
-  constexpr size_t kHashBatchBytes = 256 << 10;
-  std::string hash_batch;
-  hash_batch.reserve(kHashBatchBytes);
-  auto emit = [&](std::string_view text) {
+  void Emit(std::string_view text) {
+    constexpr size_t kHashBatchBytes = 256 << 10;
     if (hash_batch.size() + text.size() > kHashBatchBytes) {
-      update(hash_batch);
+      Update(hash_batch);
       hash_batch.clear();
       if (text.size() > kHashBatchBytes) {
-        update(text);
+        Update(text);
         return;
       }
     }
     hash_batch.append(text);
-  };
+  }
 
   // `text` is one or more whole lines, none of which starts with '#'.
-  auto feed_plain = [&](std::string_view text) {
-    emit(text);
+  void FeedPlain(std::string_view text) {
+    Emit(text);
     // Only non-linemarker lines can carry it, and once one has, there is
     // nothing left to learn, so the search stops for the rest of the file.
     // ".incbin" holds no newline, so searching a run of lines finds exactly
@@ -132,8 +128,9 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
     if (saw_incbin != nullptr && !*saw_incbin && ContainsIncbin(text)) {
       *saw_incbin = true;
     }
-  };
-  auto feed_line = [&](std::string_view line, bool with_newline) {
+  }
+
+  void FeedLine(std::string_view line, bool with_newline) {
     constexpr std::string_view kPchPragma = "#pragma GCC pch_preprocess \"";
     if (pch_paths != nullptr && line.starts_with(kPchPragma)) {
       if (line.size() <= kPchPragma.size() || line.back() != '"') {
@@ -145,35 +142,30 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
       const std::string pch(
           line.substr(kPchPragma.size(), line.size() - kPchPragma.size() - 1));
       pch_paths->push_back(pch);
-      emit(kPchPragma);
-      emit(Escape(roots.Canonicalize(pch)));
-      emit("\"");
+      Emit(kPchPragma);
+      Emit(Escape(roots->Canonicalize(pch)));
+      Emit("\"");
     } else if (!line.empty() && line[0] == '#') {
-      emit(NormalizeLinemarker(std::string(line), roots));
+      Emit(NormalizeLinemarker(std::string(line), *roots));
     } else {
-      feed_plain(line);
+      FeedPlain(line);
     }
-    if (with_newline) emit("\n");
-  };
+    if (with_newline) Emit("\n");
+  }
 
-  while (true) {
-    const size_t n = ::fread(buf.data(), 1, buf.size(), f);
-    if (n == 0) {
-      if (::ferror(f) != 0) ok = false;
-      break;
-    }
-    const char* data = buf.data();
+  void Push(const char* data, size_t n) {
+    if (n == 0) return;
     size_t line_start = 0;
     if (!pending.empty()) {
       const auto* newline = static_cast<const char*>(std::memchr(data, '\n', n));
       if (newline == nullptr) {
         pending.append(data, n);
-        continue;
+        return;
       }
       pending.append(data, newline - data);
-      feed_line(pending, true);
+      FeedLine(pending, true);
       pending.clear();
-      line_start = newline - data + 1;
+      line_start = static_cast<size_t>(newline - data) + 1;
     }
 
     // Everything up to the last newline is whole lines; the rest waits for
@@ -190,26 +182,73 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
       const auto* hash_sign =
           static_cast<const char*>(std::memchr(data + scan, '#', whole_lines_end - scan));
       if (hash_sign == nullptr) break;
-      const size_t hash_line_start = hash_sign - data;
+      const size_t hash_line_start = static_cast<size_t>(hash_sign - data);
       scan = hash_line_start + 1;
       if (hash_line_start != plain_run_start && data[hash_line_start - 1] != '\n') continue;
       if (hash_line_start > plain_run_start) {
-        feed_plain(std::string_view(data + plain_run_start, hash_line_start - plain_run_start));
+        FeedPlain(std::string_view(data + plain_run_start, hash_line_start - plain_run_start));
       }
       const auto* newline = static_cast<const char*>(
           std::memchr(data + hash_line_start, '\n', whole_lines_end - hash_line_start));
-      const size_t hash_line_end = newline - data;
-      feed_line(std::string_view(data + hash_line_start, hash_line_end - hash_line_start), true);
+      const size_t hash_line_end = static_cast<size_t>(newline - data);
+      FeedLine(std::string_view(data + hash_line_start, hash_line_end - hash_line_start), true);
       plain_run_start = scan = hash_line_end + 1;
     }
     if (whole_lines_end > plain_run_start) {
-      feed_plain(std::string_view(data + plain_run_start, whole_lines_end - plain_run_start));
+      FeedPlain(std::string_view(data + plain_run_start, whole_lines_end - plain_run_start));
     }
     if (whole_lines_end < n) pending.assign(data + whole_lines_end, n - whole_lines_end);
   }
 
-  if (ok && !pending.empty()) feed_line(pending, false);
-  if (!hash_batch.empty()) update(hash_batch);
+  bool Finish() {
+    if (ok && !pending.empty()) FeedLine(pending, false);
+    if (!hash_batch.empty()) Update(hash_batch);
+    hash_batch.clear();
+    pending.clear();
+    return ok;
+  }
+};
+
+NormalizedPreprocessHash::NormalizedPreprocessHash(const RootMap& roots, hash::Hasher* hasher,
+                                                   bool* saw_incbin, hash::Hasher* also,
+                                                   std::vector<std::string>* pch_paths)
+    : impl_(new Impl) {
+  if (saw_incbin != nullptr) *saw_incbin = false;
+  impl_->roots = &roots;
+  impl_->hasher = hasher;
+  impl_->saw_incbin = saw_incbin;
+  impl_->also = also;
+  impl_->pch_paths = pch_paths;
+  impl_->hash_batch.reserve(256 << 10);
+}
+
+NormalizedPreprocessHash::~NormalizedPreprocessHash() { delete impl_; }
+
+void NormalizedPreprocessHash::Push(const char* data, size_t n) { impl_->Push(data, n); }
+
+void NormalizedPreprocessHash::NoteReadError() { impl_->ok = false; }
+
+bool NormalizedPreprocessHash::Finish() { return impl_->Finish(); }
+
+bool HashNormalizedPreprocessedOutput(const std::string& path,
+                                      const RootMap& roots,
+                                      hash::Hasher* hasher,
+                                      bool* saw_incbin, hash::Hasher* also,
+                                      std::vector<std::string>* pch_paths) {
+  if (saw_incbin != nullptr) *saw_incbin = false;
+  FILE* f = ::fopen(path.c_str(), "rb");
+  if (f == nullptr) return false;
+  NormalizedPreprocessHash stream(roots, hasher, saw_incbin, also, pch_paths);
+  std::vector<char> buf(1 << 20);
+  while (true) {
+    const size_t n = ::fread(buf.data(), 1, buf.size(), f);
+    if (n == 0) {
+      if (::ferror(f) != 0) stream.NoteReadError();
+      break;
+    }
+    stream.Push(buf.data(), n);
+  }
+  const bool ok = stream.Finish();
   ::fclose(f);
   return ok;
 }

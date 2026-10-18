@@ -11,6 +11,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -308,21 +309,27 @@ std::string PchIdentityFromMeta(const std::string& meta) {
   return "";
 }
 
-std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
-                       const CompilerId& compiler_id, const Config& config,
-                       const std::string& native_target,
-                       const std::string& preprocessed_path, bool* saw_incbin,
-                       std::string* pch_identity, const std::string& memo_dir) {
+// Everything the cache key hashes except the preprocessed text and the PCH
+// identities that text names. The stream prototype feeds the text between
+// this and FinishCacheKey; the file path does the same.
+struct KeyHashState {
   hash::Hasher hasher;
+  hash::Hasher identity;
+  bool want_identity = false;
+  std::vector<std::string> preprocessed_pchs;
+};
+
+bool FeedCacheKeyPrefix(KeyHashState* state, const args::CompilerArgs& parsed, const RootMap& roots,
+                        const CompilerId& compiler_id, const Config& config,
+                        const std::string& native_target, bool want_pch_identity) {
   // A PCH build's identity takes every input of its key except the paths as
   // typed, so it is the same in every worktree; consumers' manifests name the
   // PCH by it where the build writes no .sum (see PchIdentity).
-  hash::Hasher identity;
-  const bool want_identity = parsed.produces_pch && pch_identity != nullptr;
-  if (want_identity) identity.UpdateDelimited(kPchIdentityVersion);
+  state->want_identity = parsed.produces_pch && want_pch_identity;
+  if (state->want_identity) state->identity.UpdateDelimited(kPchIdentityVersion);
   const auto feed = [&](std::string_view text) {
-    hasher.UpdateDelimited(text);
-    if (want_identity) identity.UpdateDelimited(text);
+    state->hasher.UpdateDelimited(text);
+    if (state->want_identity) state->identity.UpdateDelimited(text);
   };
   feed(kCacheKeyVersion);
   feed(compiler_id.fingerprint);
@@ -354,9 +361,9 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
   // PCH entry; a rebuild of the same tree, or containers that mount every tree
   // at one path, still hit.
   if (parsed.produces_pch) {
-    hasher.UpdateDelimited("pch-built-at");
-    hasher.UpdateDelimited(util::CurrentDir());
-    for (const std::string& arg : parsed.argv) hasher.UpdateDelimited(arg);
+    state->hasher.UpdateDelimited("pch-built-at");
+    state->hasher.UpdateDelimited(util::CurrentDir());
+    for (const std::string& arg : parsed.argv) state->hasher.UpdateDelimited(arg);
   }
 
   // Linker-only flags change nothing about the object under -c, and gcc ignores
@@ -380,7 +387,7 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
     auto digest = hash::HashFile(path);
     if (!digest) {
       VCACHE_LOG("cannot hash keyed input file " + path);
-      return "";
+      return false;
     }
     feed(*digest);
   }
@@ -399,17 +406,16 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
     feed(name);
     feed(value);
   }
+  return true;
+}
 
-  // The preprocessed text carries the full effect of every -I/-D/-include flag
-  // and of the source itself. Its linemarkers still hold raw absolute paths --
-  // gcc does not apply -ffile-prefix-map to them -- so they are canonicalised
-  // on the way into the hash.
-  std::vector<std::string> preprocessed_pchs;
-  if (!HashNormalizedPreprocessedOutput(preprocessed_path, roots, &hasher, saw_incbin,
-                                        want_identity ? &identity : nullptr, &preprocessed_pchs)) {
-    return "";
-  }
-  for (const std::string& pch : preprocessed_pchs) {
+std::string FinishCacheKey(KeyHashState* state, bool* saw_incbin, std::string* pch_identity,
+                           const std::string& memo_dir) {
+  const auto feed = [&](std::string_view text) {
+    state->hasher.UpdateDelimited(text);
+    if (state->want_identity) state->identity.UpdateDelimited(text);
+  };
+  for (const std::string& pch : state->preprocessed_pchs) {
     // A loaded PCH hides its assembler directives from -E. The directive's
     // external file can change without changing either the PCH or its key.
     if (saw_incbin != nullptr) {
@@ -422,8 +428,30 @@ std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
     feed("consumed-pch");
     feed(*consumed_identity);
   }
-  if (want_identity) *pch_identity = identity.Hex();
-  return hasher.Hex();
+  if (state->want_identity && pch_identity != nullptr) *pch_identity = state->identity.Hex();
+  return state->hasher.Hex();
+}
+
+std::string ComputeKey(const args::CompilerArgs& parsed, const RootMap& roots,
+                       const CompilerId& compiler_id, const Config& config,
+                       const std::string& native_target,
+                       const std::string& preprocessed_path, bool* saw_incbin,
+                       std::string* pch_identity, const std::string& memo_dir) {
+  KeyHashState state;
+  if (!FeedCacheKeyPrefix(&state, parsed, roots, compiler_id, config, native_target,
+                          pch_identity != nullptr)) {
+    return "";
+  }
+  // The preprocessed text carries the full effect of every -I/-D/-include flag
+  // and of the source itself. Its linemarkers still hold raw absolute paths --
+  // gcc does not apply -ffile-prefix-map to them -- so they are canonicalised
+  // on the way into the hash.
+  if (!HashNormalizedPreprocessedOutput(preprocessed_path, roots, &state.hasher, saw_incbin,
+                                        state.want_identity ? &state.identity : nullptr,
+                                        &state.preprocessed_pchs)) {
+    return "";
+  }
+  return FinishCacheKey(&state, saw_incbin, pch_identity, memo_dir);
 }
 
 // Writes the cached artifacts into the working tree. `lookup_started` is when
@@ -1640,6 +1668,42 @@ RecordedInputs ReadCxxPreprocessorRunInputs(const CxxPreprocessRecording& run,
 
 }  // namespace
 
+// Empty unless a task-branch prototype is selected. Any other value leaves the
+// preprocess path unchanged, so a binary built from this branch matches the
+// file-based -E path unless the caller opts in.
+std::string PreprocessCandidateId() {
+  const char* value = std::getenv("VCACHE_CXX_PREPROCESS_CANDIDATE");
+  if (value == nullptr) return "";
+  if (std::strcmp(value, "baseline-stream") == 0 || std::strcmp(value, "clang-minws") == 0) {
+    return value;
+  }
+  return "";
+}
+
+// Memoised beside the system-include probe. A compiler that rejects the flag
+// is recorded so later translations do not probe again.
+bool ClangAcceptsMinimizeWhitespace(const std::string& compiler, const std::string& cache_dir) {
+  hash::Hasher memo_key;
+  memo_key.UpdateDelimited("clang-minws-v1");
+  memo_key.UpdateDelimited(compiler);
+  const std::string dir = SystemIncludeMemoDir(cache_dir);
+  const std::string memo_path = dir + "/" + memo_key.Hex();
+  if (auto cached = util::ReadFile(memo_path)) return *cached == "yes\n";
+  std::error_code mkdir_error;
+  std::filesystem::create_directories(dir, mkdir_error);
+  const std::string src = dir + "/clang-minws-probe.cc";
+  if (mkdir_error || !util::WriteFileAtomic(src, "int axb_minws_probe;\n", /*durable=*/false)) {
+    return false;
+  }
+  const util::ProcResult probe = util::Run(
+      {compiler, "-fminimize-whitespace", "-E", src},
+      {.capture_stdout = true, .capture_stderr = true});
+  const bool yes = probe.exit_code == 0 && !probe.stdout_data.empty();
+  util::WriteFileAtomic(memo_path, yes ? std::string("yes\n") : std::string("no\n"),
+                        /*durable=*/false);
+  return yes;
+}
+
 bool PchCarriesTimestamps(const args::CompilerArgs& parsed, bool is_clang) {
   return parsed.produces_pch && is_clang && !parsed.pch_timestamp_disabled;
 }
@@ -1857,12 +1921,53 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
   const bool cold_recording = manifest_states.empty() && !parsed.produces_pch &&
                               keyed_pchs.empty() && pp_recording &&
                               pp_recording->declined.empty() && !pp_recording->tracer.empty();
-  const std::vector<std::string> pp_cmd =
+  std::vector<std::string> pp_cmd =
       pp_recording ? BuildPreprocessCommand(parsed, roots, compiler_id, pp_recording->depfile,
                                             pp_recording->absent_list)
                    : BuildPreprocessCommand(parsed, roots, compiler_id);
+  const std::string preprocess_candidate = PreprocessCandidateId();
+  if (preprocess_candidate == "clang-minws") {
+    std::string fell_back;
+    if (!compiler_id.is_clang) {
+      fell_back = parsed.compiler + " is not clang";
+    } else if (!ClangAcceptsMinimizeWhitespace(parsed.compiler, cache_dir)) {
+      fell_back = parsed.compiler + " rejected -fminimize-whitespace";
+    }
+    if (!fell_back.empty()) {
+      VCACHE_LOG("cxx preprocess: candidate clang-minws fell back: " + fell_back);
+    } else {
+      const auto flag_at = std::find(pp_cmd.begin(), pp_cmd.end(), "-E");
+      if (flag_at == pp_cmd.end()) {
+        VCACHE_LOG("cxx preprocess: candidate clang-minws fell back: preprocess command has no -E");
+      } else {
+        pp_cmd.insert(flag_at, "-fminimize-whitespace");
+      }
+    }
+  }
   util::ProcOptions pp_options{
       .capture_stdout = true, .capture_stderr = true, .stdout_file = preprocessed};
+  std::optional<KeyHashState> streamed_key;
+  std::optional<NormalizedPreprocessHash> streamed_hash;
+  bool streamed_saw = false;
+  bool streaming = false;
+  if (preprocess_candidate == "baseline-stream" && !cold_recording) {
+    streamed_key.emplace();
+    if (!FeedCacheKeyPrefix(&*streamed_key, parsed, roots, compiler_id, config, native_target,
+                            /*want_pch_identity=*/true)) {
+      VCACHE_LOG("cxx preprocess: candidate baseline-stream fell back: a keyed input could not be hashed");
+      streamed_key.reset();
+    } else {
+      streamed_hash.emplace(roots, &streamed_key->hasher, &streamed_saw,
+                            streamed_key->want_identity ? &streamed_key->identity : nullptr,
+                            &streamed_key->preprocessed_pchs);
+      pp_options.stdout_file.clear();
+      pp_options.stdout_chunk = [&](const char* data, size_t n) {
+        streamed_hash->Push(data, n);
+        return true;
+      };
+      streaming = true;
+    }
+  }
   if (!cold_recording && pp_recording && !pp_recording->trace_log.empty()) {
     pp_options.env.emplace_back("VCACHE_TRACE_LOG", pp_recording->trace_log);
     pp_options.env.emplace_back("VCACHE_TRACE_FORMAT",
@@ -1906,8 +2011,15 @@ int RunCompile(const std::vector<std::string>& argv, const Config& config,
     }
   } else {
     bool saw_incbin = false;
-    key = ComputeKey(parsed, roots, compiler_id, config, native_target, preprocessed,
-                     &saw_incbin, &pch_identity, memo_dir);
+    if (streaming) {
+      if (pp->stdout_chunk_ok && streamed_hash->Finish()) {
+        saw_incbin = streamed_saw;
+        key = FinishCacheKey(&*streamed_key, &saw_incbin, &pch_identity, memo_dir);
+      }
+    } else {
+      key = ComputeKey(parsed, roots, compiler_id, config, native_target, preprocessed,
+                       &saw_incbin, &pch_identity, memo_dir);
+    }
     if (key.empty()) {
       RecordDecision(cache_dir, Reason::kNoCacheKey);
       return RunPassthrough(argv);

@@ -47,6 +47,28 @@ bool HashNormalizedPreprocessedOutput(const std::string& path,
                                       hash::Hasher* also = nullptr,
                                       std::vector<std::string>* pch_paths = nullptr);
 
+// The same normalisation, fed a chunk at a time. A pipe and a file of the same
+// bytes produce the same digest: the hash does not depend on the read size.
+// `Finish` returns false when a PCH pragma was malformed or `NoteReadError`
+// was called. The caller discards `hasher` in that case.
+class NormalizedPreprocessHash {
+ public:
+  NormalizedPreprocessHash(const RootMap& roots, hash::Hasher* hasher, bool* saw_incbin,
+                           hash::Hasher* also = nullptr,
+                           std::vector<std::string>* pch_paths = nullptr);
+  ~NormalizedPreprocessHash();
+  NormalizedPreprocessHash(const NormalizedPreprocessHash&) = delete;
+  NormalizedPreprocessHash& operator=(const NormalizedPreprocessHash&) = delete;
+
+  void Push(const char* data, size_t n);
+  void NoteReadError();
+  bool Finish();
+
+ private:
+  struct Impl;
+  Impl* impl_;
+};
+
 // True if `line` contains an `.incbin` directive.
 //
 // The preprocessed text is vcache's stand-in for everything the compiler will

@@ -317,7 +317,7 @@ MAIN_OBJ    := $(patsubst $(TOP)/%.cc,$(OBJDIR)/%.o,$(MAIN_SRC))
 BLAKE3_OBJS := $(patsubst $(TP)/%.c,$(OBJDIR)/tp/%.o,$(BLAKE3_C)) \
                $(patsubst $(TP)/%.S,$(OBJDIR)/tp/%.o,$(BLAKE3_S))
 
-TEST_SRCS := $(filter-out $(TOP)/tests/vcache_test_alloc.cc,$(wildcard $(TOP)/tests/*.cc))
+TEST_SRCS := $(filter-out $(TOP)/tests/vcache_test_alloc.cc $(TOP)/tests/cxx_pp_digest.cc,$(wildcard $(TOP)/tests/*.cc))
 TEST_OBJS := $(patsubst $(TOP)/%.cc,$(OBJDIR)/%.o,$(TEST_SRCS))
 
 ALL_OBJS := $(VCACHE_OBJS) $(MAIN_OBJ) $(BLAKE3_OBJS) $(TEST_OBJS)
@@ -356,6 +356,12 @@ $(BINDIR)/vcache_test: $(VCACHE_OBJS) $(BLAKE3_OBJS) $(TEST_OBJS)
 $(BINDIR)/vcache_test_alloc: $(TOP)/tests/vcache_test_alloc.cc
 	@mkdir -p $(BINDIR)
 	$(CXX) -std=c++20 -O2 -o $@ $<
+
+# Not part of `all` or `test`. The preprocess harness links it against the
+# same objects the cache uses to hash preprocessor output.
+$(BINDIR)/cxx_pp_digest: $(TOP)/tests/cxx_pp_digest.cc $(VCACHE_OBJS) $(BLAKE3_OBJS)
+	@mkdir -p $(BINDIR)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(TOP)/tests/cxx_pp_digest.cc $(VCACHE_OBJS) $(BLAKE3_OBJS) $(LDLIBS)
 
 test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACER_SO)
 	$(BINDIR)/vcache_test

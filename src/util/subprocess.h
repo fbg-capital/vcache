@@ -26,14 +26,25 @@ struct ProcResult {
   // matters. A spawn that never happened leaves both at zero.
   uint64_t max_rss_kb = 0;
   uint64_t wall_ms = 0;
+
+  // False when `stdout_chunk` returned false or a stdout read failed. Unused
+  // when no chunk callback was set.
+  bool stdout_chunk_ok = true;
 };
 
 struct ProcOptions {
   bool capture_stdout = false;
   bool capture_stderr = false;
   // When set, the child's stdout is redirected into this file instead of being
-  // captured in memory. Used for large preprocessor output.
+  // captured in memory. Used for large preprocessor output. This wins over
+  // `stdout_chunk` when both are set: the callback is not called.
   std::string stdout_file;
+
+  // When set, and `stdout_file` is empty, stdout is a pipe and each read is
+  // passed here instead of being stored. The callback runs in the parent and
+  // must not block on the child. A false return marks `stdout_chunk_ok` and
+  // the pipe is still drained, so the child is not left blocked on a full pipe.
+  std::function<bool(const char* data, size_t n)> stdout_chunk;
 
   // Variables to set in the child only. The link tracer needs LD_PRELOAD and
   // its log path to reach the linker's whole process tree without vcache's own

@@ -20,7 +20,10 @@ namespace {
 
 // Drains both pipes concurrently. Reading them one after the other would
 // deadlock as soon as the child fills the pipe we are not reading.
-void PumpPipes(int out_fd, int err_fd, std::string* out, std::string* err) {
+// `chunk`, when set, receives stdout instead of `out`. A false callback or a
+// failed stdout read clears `chunk_ok`; the pipe is still drained.
+void PumpPipes(int out_fd, int err_fd, std::string* out, std::string* err,
+               const std::function<bool(const char*, size_t)>* chunk, bool* chunk_ok) {
   struct pollfd fds[2];
   int nfds = 0;
   if (out_fd >= 0) fds[nfds++] = {out_fd, POLLIN, 0};
@@ -39,9 +42,14 @@ void PumpPipes(int out_fd, int err_fd, std::string* out, std::string* err) {
       }
       ssize_t n = ::read(fds[i].fd, buf, sizeof(buf));
       if (n > 0) {
-        std::string* sink = (fds[i].fd == out_fd) ? out : err;
-        if (sink != nullptr) sink->append(buf, static_cast<size_t>(n));
+        if (fds[i].fd == out_fd && chunk != nullptr) {
+          if (!(*chunk)(buf, static_cast<size_t>(n)) && chunk_ok != nullptr) *chunk_ok = false;
+        } else {
+          std::string* sink = (fds[i].fd == out_fd) ? out : err;
+          if (sink != nullptr) sink->append(buf, static_cast<size_t>(n));
+        }
       } else if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
+        if (n < 0 && fds[i].fd == out_fd && chunk_ok != nullptr) *chunk_ok = false;
         fds[i].fd = -1;
         --open_count;
       }
@@ -129,7 +137,10 @@ ProcResult Run(const std::vector<std::string>& argv, const ProcOptions& opts) {
   if (opts.on_spawn) opts.on_spawn(pid);
   if (out_pipe[1] >= 0) ::close(out_pipe[1]);
   if (err_pipe[1] >= 0) ::close(err_pipe[1]);
-  PumpPipes(out_pipe[0], err_pipe[0], &result.stdout_data, &result.stderr_data);
+  const bool use_chunk = static_cast<bool>(opts.stdout_chunk) && opts.stdout_file.empty();
+  PumpPipes(out_pipe[0], err_pipe[0], use_chunk ? nullptr : &result.stdout_data,
+            &result.stderr_data, use_chunk ? &opts.stdout_chunk : nullptr,
+            use_chunk ? &result.stdout_chunk_ok : nullptr);
   if (out_pipe[0] >= 0) ::close(out_pipe[0]);
   if (err_pipe[0] >= 0) ::close(err_pipe[0]);
 

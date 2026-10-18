@@ -1010,6 +1010,16 @@ void TestPreprocessedHashSlicing() {
     Check(read, what + ": file read");
     CheckEq(hasher.Hex(), expected, what + ": digest matches the per-line loop");
     Check(saw_incbin == expected_incbin, what + ": .incbin verdict matches the per-line loop");
+
+    hash::Hasher streamed;
+    bool stream_incbin = !expected_incbin;
+    core::NormalizedPreprocessHash stream(roots, &streamed, &stream_incbin);
+    for (size_t i = 0; i < text.size(); i += 3) {
+      stream.Push(text.data() + i, std::min<size_t>(3, text.size() - i));
+    }
+    Check(stream.Finish(), what + ": streamed read finished");
+    CheckEq(streamed.Hex(), expected, what + ": streamed digest matches the per-line loop");
+    Check(stream_incbin == expected_incbin, what + ": streamed .incbin verdict matches the per-line loop");
   };
 
   constexpr size_t kReadSize = 1 << 20;
