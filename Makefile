@@ -366,6 +366,8 @@ test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACE
 	@bash $(TOP)/tests/link_verify_test.sh
 	@bash $(TOP)/tests/anvil_publish_test.sh
 	@PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/link_verify_worktrees_test.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/link_soak_test.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/link_soak_capture_test.py $(BINDIR)/vcache
 	@CXX="$(CXX)" PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/cxx_scratch_test.py $(BINDIR)/vcache
 	@CC="$(CC)" PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/session_daemon_startup_test.py $(BINDIR)/vcache_test
 
