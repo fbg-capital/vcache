@@ -46,7 +46,7 @@ RESUME_FIELDS = (
 # E2 may change because linemarkers move. E11 is unchanged by the matrix but is
 # not in the I2 list; the matrix still requires it to stay unchanged.
 UNCHANGED_EDITS = {"E1", "E3", "E10", "E11"}
-CHANGED_EDITS = {"E4", "E5", "E6", "E7", "E9"}
+CHANGED_EDITS = {"E4", "E5", "E7", "E9"}
 CONSTANT_DIGEST = "constant"
 
 # Mutation switches. The tests flip these, show the guard fail, and restore them.
@@ -199,7 +199,9 @@ def check_compiler_expectation(edit, before, after, e8_phase=None):
             expect = True
         else:
             raise CorpusAnomaly(f"E8 requires e8_phase E1 or E4, got {e8_phase!r}")
-    elif edit == "E2":
+    elif edit in {"E2", "E6"}:
+        # E2 may or may not move linemarkers. E6 changes the text only when a
+        # swapped include still expands; a no-op is recorded, not an anomaly.
         return changed
     elif edit in UNCHANGED_EDITS:
         expect = False

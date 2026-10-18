@@ -77,6 +77,12 @@ class JudgeTest(unittest.TestCase):
         with self.assertRaises(ev.CorpusAnomaly):
             ev.check_compiler_expectation("E1", "a", "b")
 
+    def test_e6_unchanged_is_not_an_anomaly(self):
+        changed = ev.check_compiler_expectation("E6", "same", "same")
+        self.assertFalse(changed)
+        changed = ev.check_compiler_expectation("E6", "before", "after")
+        self.assertTrue(changed)
+
     def test_e8_phases(self):
         ev.check_compiler_expectation("E8", "a", "a", e8_phase="E1")
         ev.check_compiler_expectation("E8", "a", "b", e8_phase="E4")

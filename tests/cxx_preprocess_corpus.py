@@ -177,7 +177,8 @@ def main():
         }
 
     def record(candidate, edit, tu, compiler_before, compiler_after, candidate_before,
-               candidate_after, absent_before, absent_after, fell_back, why, elapsed):
+               candidate_after, absent_before, absent_after, fell_back, why, elapsed,
+               reason=""):
         base = row_base(candidate, edit, tu)
         if ev.should_skip_row(existing, base):
             return
@@ -206,6 +207,7 @@ def main():
             "elapsed_s": round(elapsed, 4),
             "absent_before": absent_before,
             "absent_after": absent_after,
+            "reason": reason,
         })
         ev.append_jsonl(args.results, item)
         existing.add(ev.resume_key(item))
@@ -223,9 +225,22 @@ def main():
         return ev.compiler_digest(text, roots), "", elapsed
 
     # Baseline, no edit. Candidate baseline-file matches the compiler.
+    # A resumed run reuses digests already stored for this revision.
     print("baseline", len(indexed), flush=True)
     baseline = {}
+    if Path(args.results).exists():
+        for line in Path(args.results).read_text().splitlines():
+            if not line.strip():
+                continue
+            stored = json.loads(line)
+            if (stored.get("candidate") == "baseline-file" and stored.get("edit") == "baseline"
+                    and stored.get("platform") == args.platform
+                    and stored.get("vcache_revision") == args.vcache_revision
+                    and stored.get("compiler_before")):
+                baseline[stored["tu"]] = stored["compiler_before"]
     for rel, (entry, _headers) in indexed.items():
+        if rel in baseline:
+            continue
         digest, why, elapsed = digest_tu(entry)
         if digest is None:
             record("baseline-file", "baseline", rel, "", "", "", "", [], [], True, why, elapsed)
@@ -261,32 +276,56 @@ def main():
                         if ev.is_pch_consumer(entry["command"])]
         else:
             affected = [rel for rel, (_entry, headers) in indexed.items() if header_rel in headers]
-        print(f"{edit} {header_rel} tus={len(affected)}", flush=True)
+        pending = []
         for rel in affected:
+            tu_name = rel + tu_suffix
+            edits = ("E6", "E6 no-op") if edit == "E6" else (edit,)
+            if any(ev.should_skip_row(existing, row_base("baseline-file", name, tu_name))
+                   for name in edits):
+                continue
+            pending.append(rel)
+        if not pending:
+            print(f"{edit} {header_rel} skipped", flush=True)
+            path.write_text(original)
+            return
+        print(f"{edit} {header_rel} tus={len(pending)}", flush=True)
+        noop = 0
+        changed = 0
+        for rel in pending:
             entry, _headers = indexed[rel]
             before = baseline.get(rel)
             if before is None:
                 continue
             digest, why, elapsed = digest_tu(entry)
             if digest is None:
-                record("baseline-file", edit, rel, before, "", "", "", [], [], True, why, elapsed)
+                record("baseline-file", edit, rel + tu_suffix, before, "", "", "", [], [], True, why, elapsed)
                 continue
             try:
                 ev.check_compiler_expectation(edit, before, digest, e8_phase=e8_phase)
             except ev.CorpusAnomaly as exc:
                 anomaly = Path(args.results).parent / "anomaly.txt"
-                anomaly.write_text(f"{edit} {rel} {header_rel}: {exc}\n")
+                with anomaly.open("a") as out:
+                    out.write(f"{edit} {rel} {header_rel}: {exc}\n")
                 print(f"I2 anomaly {exc} tu={rel}", flush=True)
                 path.write_text(original)
                 raise SystemExit(3)
             main_before = ev.unsound_main_file_digest(Path(entry["file"]).read_text(errors="replace"))
             tu_name = rel + tu_suffix
-            record("baseline-file", edit, tu_name, before, digest, before, digest, [], [], False, "", elapsed)
-            record("unsound-main-file-only", edit, tu_name, before, digest, main_before, main_before,
-                   [], [], False, "", elapsed)
+            row_edit = edit
+            reason = ""
+            if edit == "E6" and digest == before:
+                row_edit = "E6 no-op"
+                reason = "both headers already included"
+                noop += 1
+            elif edit == "E6":
+                changed += 1
+            record("baseline-file", row_edit, tu_name, before, digest, before, digest,
+                   [], [], False, "", elapsed, reason)
+            record("unsound-main-file-only", row_edit, tu_name, before, digest, main_before, main_before,
+                   [], [], False, "", elapsed, reason)
             const = ev.unsound_constant_digest(digest)
-            record("unsound-constant", edit, tu_name, before, digest, ev.CONSTANT_DIGEST, const,
-                   [], [], False, "", elapsed)
+            record("unsound-constant", row_edit, tu_name, before, digest, ev.CONSTANT_DIGEST, const,
+                   [], [], False, "", elapsed, reason)
             if digest != before and const == ev.CONSTANT_DIGEST:
                 ev.save_counterexample(Path(args.results).parent, "unsound-constant", edit, tu_name, {
                     "compiler_before": before, "compiler_after": digest, "candidate": ev.CONSTANT_DIGEST,
@@ -297,6 +336,13 @@ def main():
                     "candidate_before": main_before, "candidate_after": main_before,
                 })
         path.write_text(original)
+        if edit == "E6":
+            line = (f"\nE6 no-op rows ({args.platform}): {noop}; "
+                    f"E6 changed rows: {changed}. "
+                    f"No-op reason: both headers already included.\n")
+            print(line.strip(), flush=True)
+            with (Path(args.results).parent / "timings.md").open("a") as out:
+                out.write(line)
         # I3: one sentinel TU must match its pre-matrix baseline after revert.
         if affected:
             rel = affected[0]
