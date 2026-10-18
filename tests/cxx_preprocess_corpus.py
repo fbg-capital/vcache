@@ -15,6 +15,7 @@ import shlex
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -234,7 +235,7 @@ def main():
         main = ev.unsound_main_file_digest(Path(entry["file"]).read_text(errors="replace"))
         record("unsound-main-file-only", "baseline", rel, digest, digest, main, main, [], [], False, "", elapsed)
 
-    def apply_and_measure(edit, header_rel, e8_phase=None):
+    def apply_and_measure(edit, header_rel, e8_phase=None, tu_suffix=""):
         path = source_root / header_rel
         if not path.is_file():
             print(f"missing header {header_rel}", flush=True)
@@ -253,9 +254,13 @@ def main():
             print(f"anomaly {edit} {header_rel}: {exc}", flush=True)
             path.write_text(original)
             return
-        affected = [rel for rel, (_entry, headers) in indexed.items() if header_rel in headers]
-        if not affected and header_rel.endswith("imacros.h"):
+        if header_rel.endswith("protocol/dev/imacros.h"):
             affected = list(indexed)
+        elif header_rel.endswith("NlohmannJsonExternTemplates.h"):
+            affected = [rel for rel, (entry, _headers) in indexed.items()
+                        if ev.is_pch_consumer(entry["command"])]
+        else:
+            affected = [rel for rel, (_entry, headers) in indexed.items() if header_rel in headers]
         print(f"{edit} {header_rel} tus={len(affected)}", flush=True)
         for rel in affected:
             entry, _headers = indexed[rel]
@@ -275,18 +280,19 @@ def main():
                 path.write_text(original)
                 raise SystemExit(3)
             main_before = ev.unsound_main_file_digest(Path(entry["file"]).read_text(errors="replace"))
-            record("baseline-file", edit, rel, before, digest, before, digest, [], [], False, "", elapsed)
-            record("unsound-main-file-only", edit, rel, before, digest, main_before, main_before,
+            tu_name = rel + tu_suffix
+            record("baseline-file", edit, tu_name, before, digest, before, digest, [], [], False, "", elapsed)
+            record("unsound-main-file-only", edit, tu_name, before, digest, main_before, main_before,
                    [], [], False, "", elapsed)
             const = ev.unsound_constant_digest(digest)
-            record("unsound-constant", edit, rel, before, digest, ev.CONSTANT_DIGEST, const,
+            record("unsound-constant", edit, tu_name, before, digest, ev.CONSTANT_DIGEST, const,
                    [], [], False, "", elapsed)
             if digest != before and const == ev.CONSTANT_DIGEST:
-                ev.save_counterexample(Path(args.results).parent, "unsound-constant", edit, rel, {
+                ev.save_counterexample(Path(args.results).parent, "unsound-constant", edit, tu_name, {
                     "compiler_before": before, "compiler_after": digest, "candidate": ev.CONSTANT_DIGEST,
                 })
             if edit == "E4" and digest != before:
-                ev.save_counterexample(Path(args.results).parent, "unsound-main-file-only", "E4", rel, {
+                ev.save_counterexample(Path(args.results).parent, "unsound-main-file-only", "E4", tu_name, {
                     "compiler_before": before, "compiler_after": digest,
                     "candidate_before": main_before, "candidate_after": main_before,
                 })
@@ -302,8 +308,8 @@ def main():
     for header in MATRIX_HEADERS:
         for edit in HEADER_EDITS:
             apply_and_measure(edit, header)
-    apply_and_measure("E8", "cmake/pch/NlohmannJsonExternTemplates.h", e8_phase="E1")
-    apply_and_measure("E8", "cmake/pch/NlohmannJsonExternTemplates.h", e8_phase="E4")
+    apply_and_measure("E8", "cmake/pch/NlohmannJsonExternTemplates.h", e8_phase="E1", tu_suffix="#E8E1")
+    apply_and_measure("E8", "cmake/pch/NlohmannJsonExternTemplates.h", e8_phase="E4", tu_suffix="#E8E4")
     apply_and_measure("E5", "protocol/types/SymbolId.h")
     apply_and_measure("E6", "protocol/types/SymbolId.h")
     for index in range(1, 10):
