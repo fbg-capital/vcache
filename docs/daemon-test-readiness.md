@@ -105,3 +105,40 @@ test: its input could age past the two-second unsettled window during preceding
 filesystem checks. That assertion now uses the existing injected clock at the
 fixture's ctime, preserving the intended unsettled state regardless of test duration.
 The original failure is retained in `gate-final.log` in the evidence directory.
+
+## Lock acquisition errors
+
+The daemon previously treated every failed nonblocking `flock` as contention.
+An interrupted call therefore prevented startup even when no other daemon owned
+the cache. Lock-service failures such as `ENOLCK` and I/O errors were also reported
+as an existing daemon, hiding the actual failure from the caller.
+
+`AcquireLock` retries `EINTR`, reports only `EWOULDBLOCK`/`EAGAIN` as contention,
+and returns other errors with the lock path and original error description.
+Failed descriptors are closed; successful startup and genuine contention retain
+their existing behavior. Cache keys, readiness format and timeouts are unchanged.
+
+The readiness suite injects faults only into the actual daemon lock descriptor.
+Four cases fail on `dccde85`: two interruptions before acquiring a free lock, two
+interruptions before discovering a held lock, `ENOLCK`, and `EIO`. The held-lock
+case requires evidence that the real lock operation was retried, so an early
+false contention reply cannot pass. The existing eleven readiness checks remain
+controls. Evidence is retained under
+`/build/richard/codex-1000/daemon-lock-errors-20261018/`.
+
+This confirmed error-handling defect does not establish the cause of the
+historical startup timeouts, which remain under investigation.
+
+The disk-backed gate hit an existing lease/Put timing failure. A diagnostic unit
+run reproduced a Put timeout: `unit-trace.2443138` records a 528 ms blob `fsync`,
+followed by `EPIPE` after the test client's 500 ms deadline. Both logs are retained
+as `gate.log` and `diagnostic-unit.log`; neither run had a daemon startup failure.
+The full gate therefore also runs with task-local tmpfs scratch in a private mount
+namespace, retaining the ordinary UID and dropping all namespace capabilities
+before testing. No assertion or deadline is changed. This isolates the lock fix
+from the known disk-latency limitation; it does not resolve that limitation.
+
+`after.log` passes all fifteen readiness cases on disk-backed scratch.
+`gate-tmpfs.log` passes the full host gate: 1,564 unit, 1,342 integration,
+93 link-verification and 93 publisher checks plus the ancillary suites.
+The fault shim requires Linux; no macOS or Linux aarch64 execution is claimed.

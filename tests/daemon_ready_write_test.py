@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Unto Labs
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise the real daemon's readiness pipe under interrupted and short writes."""
+"""Exercise real daemon readiness replies under write and lock failures."""
 
 import errno
 import fcntl
@@ -19,19 +19,50 @@ SHIM = r'''
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int ready_fd = -1;
 static unsigned int calls;
+static unsigned int lock_calls;
 static const char *fault;
+static char lock_path[PATH_MAX];
 
 __attribute__((constructor)) static void initialize(void) {
   const char *descriptor = getenv("VCACHE_DAEMON_READY_FD");
   if (descriptor) ready_fd = atoi(descriptor);
   fault = getenv("VCACHE_TEST_READY_WRITE");
+  const char *store = getenv("VCACHE_DIR");
+  if (store) snprintf(lock_path, sizeof(lock_path), "%s/daemon/lock", store);
+}
+
+int flock(int fd, int operation) {
+  int (*next)(int, int) = dlsym(RTLD_NEXT, "flock");
+  struct stat descriptor, path;
+  if (fault && strncmp(fault, "flock-", 6) == 0 &&
+      operation == (LOCK_EX | LOCK_NB) && fstat(fd, &descriptor) == 0 &&
+      stat(lock_path, &path) == 0 && descriptor.st_dev == path.st_dev &&
+      descriptor.st_ino == path.st_ino) {
+    if (strstr(fault, "interrupted")) {
+      if (lock_calls++ < 2) {
+        fputs("injected flock EINTR\n", stderr);
+        errno = EINTR;
+        return -1;
+      }
+      fputs("retried flock\n", stderr);
+    } else {
+      fputs("injected flock error\n", stderr);
+      errno = strcmp(fault, "flock-enolck") == 0 ? ENOLCK : EIO;
+      return -1;
+    }
+  }
+  return next(fd, operation);
 }
 
 int bind(int fd, const struct sockaddr *address, socklen_t size) {
@@ -81,14 +112,15 @@ def run(binary, work):
     socket_path = work / 's'
     cases = ['healthy', 'ready-eintr', 'lock', 'lock-eintr', 'error-control',
              'error-eintr', 'error-short', 'error-partial-interrupted',
-             'zero', 'failed', 'closed-reader']
+             'zero', 'failed', 'closed-reader', 'flock-interrupted',
+             'flock-held-interrupted', 'flock-enolck', 'flock-eio']
     failures = 0
     for name in cases:
         store = work / name
         state = store / 'daemon'
         state.mkdir(parents=True)
         with (state / 'lock').open('w') as lock:
-            if name.startswith('lock'):
+            if name.startswith('lock') or name == 'flock-held-interrupted':
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             read_fd, write_fd = os.pipe()
             env = dict(environment, VCACHE_DIR=str(store), VCACHE_DAEMON_SOCKET=str(socket_path))
@@ -120,9 +152,14 @@ def run(binary, work):
                     expected_exit = 1
                     expected = ('Ebind ' + str(socket_path) + ': ' +
                                 os.strerror(errno.EADDRINUSE)).encode()
-                elif name.startswith('lock'):
+                elif name.startswith('lock') or name == 'flock-held-interrupted':
                     expected_exit = 3
                     expected = b'L'
+                elif name in ('flock-enolck', 'flock-eio'):
+                    expected_exit = 1
+                    error_number = errno.ENOLCK if name == 'flock-enolck' else errno.EIO
+                    expected = ('Ecannot lock ' + str(state / 'lock') + ': ' +
+                                os.strerror(error_number)).encode()
                 elif name in ('zero', 'failed', 'closed-reader'):
                     expected = b''
                 if expected_exit == 0:
@@ -146,6 +183,12 @@ def run(binary, work):
                     passed &= b'injected EINTR\n' in output
                 if 'short' in name or name == 'error-partial-interrupted':
                     passed &= b'injected short write\n' in output
+                if name.startswith('flock-'):
+                    if 'interrupted' in name:
+                        passed &= output.count(b'injected flock EINTR\n') == 2
+                        passed &= b'retried flock\n' in output
+                    else:
+                        passed &= b'injected flock error\n' in output
             except subprocess.TimeoutExpired:
                 output += b'readiness write did not terminate\n'
                 passed = False
