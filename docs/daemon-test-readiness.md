@@ -99,3 +99,9 @@ the child's output once, including after timeout cleanup, with assertions unchan
 The full host gate passed 1,564 unit, 1,342 integration, 93 link-verification and
 93 publisher checks plus the ancillary suites. Linux aarch64 and macOS were not
 executed for this fix.
+
+The final merge gate also exposed a timing assumption in the existing digest-table
+test: its input could age past the two-second unsettled window during preceding
+filesystem checks. That assertion now uses the existing injected clock at the
+fixture's ctime, preserving the intended unsettled state regardless of test duration.
+The original failure is retained in `gate-final.log` in the evidence directory.

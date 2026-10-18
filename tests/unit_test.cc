@@ -6195,7 +6195,7 @@ void TestFileDigestTable() {
     CheckEq(lookup(directory), original, damage + " table fallback remains usable");
   }
 
-  CheckEq(hash::HashFileMemoized(input, memo_dir).value_or(""), original,
+  CheckEq(hash::HashFileMemoizedAt(input, memo_dir, slot.identity.ctime_ns).value_or(""), original,
           "unsettled identity cannot use even a previously published entry");
   struct stat input_stat {};
   ::stat(input.c_str(), &input_stat);
