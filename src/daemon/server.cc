@@ -546,10 +546,18 @@ bool Server::AcquireLock(std::string* error) {
     *error = "cannot open " + path + ": " + std::strerror(errno);
     return false;
   }
-  if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+  int lock_result;
+  do {
+    lock_result = ::flock(lock_fd_, LOCK_EX | LOCK_NB);
+  } while (lock_result != 0 && errno == EINTR);
+  if (lock_result != 0) {
+    const int lock_error = errno;
+    if (lock_error != EWOULDBLOCK && lock_error != EAGAIN) {
+      *error = "cannot lock " + path + ": " + std::strerror(lock_error);
+    }
     ::close(lock_fd_);
     lock_fd_ = -1;
-    return false;  // held: another daemon owns this cache
+    return false;
   }
   util::WriteFileAtomic(state_dir_ + "/pid", std::to_string(::getpid()) + "\n");
   return true;
