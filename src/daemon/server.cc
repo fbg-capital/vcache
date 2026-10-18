@@ -559,7 +559,9 @@ bool Server::AcquireLock(std::string* error) {
     lock_fd_ = -1;
     return false;
   }
-  util::WriteFileAtomic(state_dir_ + "/pid", std::to_string(::getpid()) + "\n");
+  // The lock establishes ownership; the informational PID is obsolete after a crash.
+  util::WriteFileAtomic(state_dir_ + "/pid", std::to_string(::getpid()) + "\n",
+                        /*durable=*/false);
   return true;
 }
 
