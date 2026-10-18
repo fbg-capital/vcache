@@ -46,19 +46,41 @@ def load_commands(path):
     return rows
 
 
-def parse_deps(path):
-    """object path relative to the build dir -> set of repo-relative headers."""
+def parse_deps(path, build_dir=None, source_root=None):
+    """Resolved object path -> repo-relative headers.
+
+    Ninja prints dependencies relative to the physical build directory. A
+    symlinked build dir climbs out with several `../` segments; resolving them
+    is what makes the header name match the source tree.
+    """
+    build = Path(build_dir).resolve() if build_dir else None
+    source = Path(source_root).resolve() if source_root else None
     out = {}
     current = None
     for line in Path(path).read_text(errors="replace").splitlines():
         if ": #deps" in line and not line.startswith(" "):
-            current = line.split(": #deps", 1)[0]
-            out[current] = set()
+            name = line.split(": #deps", 1)[0]
+            if build is not None:
+                current = str((build / name).resolve())
+            else:
+                current = name
+            out.setdefault(current, set())
             continue
-        if current is not None and line.startswith("    "):
-            dep = line.strip()
-            if dep.startswith("../"):
-                out[current].add(dep[3:])
+        if current is None or not line.startswith("    "):
+            continue
+        raw = line.strip()
+        rel = None
+        if build is not None and source is not None:
+            candidate = Path(raw) if raw.startswith("/") else build / raw
+            try:
+                resolved = candidate.resolve()
+                rel = str(resolved.relative_to(source))
+            except (OSError, ValueError):
+                rel = None
+        if rel is None and raw.startswith("../"):
+            rel = raw[3:]
+        if rel:
+            out[current].add(rel)
     return out
 
 
@@ -71,6 +93,11 @@ def tu_id(entry, source_prefix):
 
 def object_key(entry, build_prefix):
     output = entry.get("output", "")
+    if output:
+        try:
+            return str(Path(output).resolve())
+        except OSError:
+            pass
     if build_prefix and output.startswith(build_prefix):
         return output[len(build_prefix):].lstrip("/")
     return output
@@ -143,7 +170,7 @@ def main():
     commands = load_commands(args.compile_commands)
     if args.limit:
         commands = commands[: args.limit]
-    deps = parse_deps(args.deps)
+    deps = parse_deps(args.deps, args.build_prefix, args.source_prefix)
     by_tu = []
     fanout = {header: [] for header in MATRIX_HEADERS}
     for entry in commands:
@@ -353,7 +380,9 @@ def main():
 
     for header in MATRIX_HEADERS:
         for edit in HEADER_EDITS:
-            apply_and_measure(edit, header)
+            # The header is part of the row key so E1 on SymbolId.h does not
+            # resume-skip E1 on Price.h for a TU that includes both.
+            apply_and_measure(edit, header, tu_suffix="#" + header)
     apply_and_measure("E8", "cmake/pch/NlohmannJsonExternTemplates.h", e8_phase="E1", tu_suffix="#E8E1")
     apply_and_measure("E8", "cmake/pch/NlohmannJsonExternTemplates.h", e8_phase="E4", tu_suffix="#E8E4")
     apply_and_measure("E5", "protocol/types/SymbolId.h")
