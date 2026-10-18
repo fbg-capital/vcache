@@ -89,3 +89,13 @@ two-second startup timeouts. Those retained failures and their follow-up remain
 open. The normal gate includes both the earlier fixture tests and this production
 write suite. Evidence is under
 `/build/richard/codex-1000/daemon-ready-write-20261018/`.
+
+The runtime fix was merged as `4be8f9f` (implementation `cdb9bac`) and published
+as Anvil 1.8 for all five targets. Installed host, EL10 and dc-build binary/tracer
+pairs match those artifacts, and each passes all eleven readiness checks in its
+own environment. The dc-build run uses Python 3.6; it exposed a harness cleanup
+error from calling `communicate()` twice on closed output. The harness now collects
+the child's output once, including after timeout cleanup, with assertions unchanged.
+The full host gate passed 1,564 unit, 1,342 integration, 93 link-verification and
+93 publisher checks plus the ancillary suites. Linux aarch64 and macOS were not
+executed for this fix.

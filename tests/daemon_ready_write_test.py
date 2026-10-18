@@ -104,6 +104,7 @@ def run(binary, work):
             reply = b''
             ended = read_fd < 0
             output = b''
+            output_collected = False
             status_output = b''
             passed = False
             try:
@@ -139,6 +140,7 @@ def run(binary, work):
                 else:
                     passed = True
                 output, _ = process.communicate(timeout=5)
+                output_collected = True
                 passed &= ended and reply == expected and process.returncode == expected_exit
                 if 'eintr' in name or name == 'error-partial-interrupted':
                     passed &= b'injected EINTR\n' in output
@@ -152,9 +154,9 @@ def run(binary, work):
                     os.close(read_fd)
                 if process.poll() is None:
                     process.kill()
-                remainder, _ = process.communicate()
-                if not output:
-                    output = remainder
+                if not output_collected:
+                    remainder, _ = process.communicate()
+                    output += remainder
             with (work / (name + '.log')).open('xb') as log:
                 log.write(('reply={!r}\nexit={}\n'.format(reply, process.returncode)).encode())
                 log.write(output + status_output)
