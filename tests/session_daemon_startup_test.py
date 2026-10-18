@@ -17,7 +17,9 @@ def run(binary, work):
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
@@ -33,6 +35,23 @@ __attribute__((constructor)) static void initialize(void) {
   fault = getenv("VCACHE_TEST_STARTUP_FAULT");
 }
 static int injecting(const char *name) { return fault && strcmp(fault, name) == 0; }
+
+int fsync(int descriptor) {
+  int (*next)(int) = dlsym(RTLD_NEXT, "fsync");
+  if (getpid() != parent_pid && injecting("pid-fsync-stall")) {
+    char link[64], path[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", descriptor);
+    ssize_t length = readlink(link, path, sizeof(path) - 1);
+    if (length >= 0) {
+      path[length] = '\0';
+      if (strstr(path, "/cache/daemon/.vcache-tmp-")) {
+        fputs("stalled PID fsync\n", stderr);
+        for (;;) pause();
+      }
+    }
+  }
+  return next(descriptor);
+}
 
 int pipe(int descriptors[2]) {
   int (*next)(int *) = dlsym(RTLD_NEXT, "pipe");
@@ -112,6 +131,7 @@ char *mkdtemp(char *path) {
     environment.update(LD_PRELOAD=str(shim), TMPDIR=str(work))
     cases = [
         ("healthy", None),
+        ("pid-fsync-stall", None),
         ("poll-interrupted", None),
         ("read-interrupted", None),
         ("directory", "temporary directory:"),

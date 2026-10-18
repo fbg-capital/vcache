@@ -86,6 +86,10 @@ makes it the obvious place to hang future work that needs a single view of the
 cache, distributed compilation above all, without changing the wire format
 compiles already speak.
 
+Ownership is enforced by the held file lock. The informational `daemon/pid` file
+is replaced atomically without a durability flush: its contents are obsolete
+after a crash, so startup does not wait for that disk flush before listening.
+
 ## What does not change
 
 **Entries.** The disk layer has the same layout, and blobs are the same bytes

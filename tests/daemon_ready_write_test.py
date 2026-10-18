@@ -33,6 +33,7 @@ static unsigned int calls;
 static unsigned int lock_calls;
 static const char *fault;
 static char lock_path[PATH_MAX];
+static char pid_temp_prefix[PATH_MAX];
 
 __attribute__((constructor)) static void initialize(void) {
   const char *descriptor = getenv("VCACHE_DAEMON_READY_FD");
@@ -40,6 +41,24 @@ __attribute__((constructor)) static void initialize(void) {
   fault = getenv("VCACHE_TEST_READY_WRITE");
   const char *store = getenv("VCACHE_DIR");
   if (store) snprintf(lock_path, sizeof(lock_path), "%s/daemon/lock", store);
+  if (store) snprintf(pid_temp_prefix, sizeof(pid_temp_prefix), "%s/daemon/.vcache-tmp-", store);
+}
+
+int fsync(int fd) {
+  int (*next)(int) = dlsym(RTLD_NEXT, "fsync");
+  if (fault && strcmp(fault, "pid-fsync-stall") == 0) {
+    char link[64], path[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t length = readlink(link, path, sizeof(path) - 1);
+    if (length >= 0) {
+      path[length] = '\0';
+      if (strncmp(path, pid_temp_prefix, strlen(pid_temp_prefix)) == 0) {
+        fputs("stalled PID fsync\n", stderr);
+        for (;;) pause();
+      }
+    }
+  }
+  return next(fd);
 }
 
 int flock(int fd, int operation) {
@@ -113,12 +132,14 @@ def run(binary, work):
     cases = ['healthy', 'ready-eintr', 'lock', 'lock-eintr', 'error-control',
              'error-eintr', 'error-short', 'error-partial-interrupted',
              'zero', 'failed', 'closed-reader', 'flock-interrupted',
-             'flock-held-interrupted', 'flock-enolck', 'flock-eio']
+             'flock-held-interrupted', 'flock-enolck', 'flock-eio', 'pid-fsync-stall']
     failures = 0
     for name in cases:
         store = work / name
         state = store / 'daemon'
         state.mkdir(parents=True)
+        if name == 'pid-fsync-stall':
+            (state / 'pid').write_text('stale PID\n')
         with (state / 'lock').open('w') as lock:
             if name.startswith('lock') or name == 'flock-held-interrupted':
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -173,12 +194,16 @@ def run(binary, work):
                         time.sleep(0.01)
                     status_output = status.stdout
                     passed = status.returncode == 0
+                    if name == 'pid-fsync-stall':
+                        passed &= (state / 'pid').read_text() == str(process.pid) + '\n'
                     process.terminate()
                 else:
                     passed = True
                 output, _ = process.communicate(timeout=5)
                 output_collected = True
                 passed &= ended and reply == expected and process.returncode == expected_exit
+                if name == 'pid-fsync-stall':
+                    passed &= not (state / 'pid').exists()
                 if 'eintr' in name or name == 'error-partial-interrupted':
                     passed &= b'injected EINTR\n' in output
                 if 'short' in name or name == 'error-partial-interrupted':

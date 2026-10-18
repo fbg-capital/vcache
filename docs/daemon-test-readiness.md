@@ -1,8 +1,10 @@
 # Session-daemon test readiness
 
-The failures recorded during the lazy-scratch change did not recur in six
+The failures recorded during the lazy-scratch change initially did not recur in six
 instrumented unit-suite runs or 1,000 isolated daemon starts. Those runs do not
-establish the cause of the historical failures.
+establish the cause of the historical failures. The later disk-flush investigation
+below identifies a confirmed startup stall without attributing every older timeout
+to that mechanism.
 
 The investigation did establish two defects in the test helper. Its single
 `poll`/`read` attempt rejected an interrupted system call as a startup failure,
@@ -84,9 +86,9 @@ write errors and a closed reader are controls. A separate mutation removing the
 stop-on-zero/error behavior makes those two bounded-completion checks fail.
 Every foreground daemon is stopped and reaped by the harness.
 
-This is a confirmed notification defect, not an attribution of the historical
-two-second startup timeouts. Those retained failures and their follow-up remain
-open. The normal gate includes both the earlier fixture tests and this production
+This established a notification defect without attributing the historical
+two-second startup timeouts. The retained failures required the later investigation
+below. The normal gate includes both the earlier fixture tests and this production
 write suite. Evidence is under
 `/build/richard/codex-1000/daemon-ready-write-20261018/`.
 
@@ -126,8 +128,8 @@ false contention reply cannot pass. The existing eleven readiness checks remain
 controls. Evidence is retained under
 `/build/richard/codex-1000/daemon-lock-errors-20261018/`.
 
-This confirmed error-handling defect does not establish the cause of the
-historical startup timeouts, which remain under investigation.
+This established a lock error-handling defect without attributing the
+historical startup timeouts.
 
 The disk-backed gate hit an existing lease/Put timing failure. A diagnostic unit
 run reproduced a Put timeout: `unit-trace.2443138` records a 528 ms blob `fsync`,
@@ -142,3 +144,42 @@ from the known disk-latency limitation; it does not resolve that limitation.
 `gate-tmpfs.log` passes the full host gate: 1,564 unit, 1,342 integration,
 93 link-verification and 93 publisher checks plus the ancillary suites.
 The fault shim requires Linux; no macOS or Linux aarch64 execution is claimed.
+
+## PID-file flush investigation
+
+The startup-timeout investigation remained relevant after the readiness-write and
+lock-error fixes. Two retained failures from the shared digest-table gate had a
+complete temporary PID file but no published `daemon/pid`. Those artifacts locate
+the delay before PID publication, but alone do not distinguish disk waiting from
+scheduling delays. Another retained failure had progressed as far as listening.
+
+A normal disk-backed gate at `60203a3`, traced without injected delays or added
+load, observed a real daemon spending **2.025114 seconds in the PID-file `fsync`**.
+The next syscall renamed that temporary file to `daemon/pid`; the server then
+started accepting requests. That flush alone exceeds the fixture's two-second
+startup deadline. A separate unit-fixture PID flush took 1.598923 seconds in the
+same run. The gate passed: the observed two-second stall occurred in an integration
+daemon whose caller waits longer, not in a newly failing unit fixture.
+
+`AcquireLock` now publishes the PID atomically without requesting durability.
+The held file lock, not the PID file, establishes ownership. A PID is obsolete
+after a crash, so persisting it before the server can listen adds no correctness
+guarantee. Writes still check close errors and rename atomically. Durable cache
+entries, manifests and upload journals are unchanged, as are cache keys and
+startup deadlines.
+
+Both startup harnesses now stall only an `fsync` of the daemon's temporary PID
+file. On `60203a3`, the unit fixture fails at 2,002 ms and the production daemon
+never reports readiness. Existing controls pass. The production regression also
+checks that the new PID replaces stale contents and disappears on normal shutdown.
+These tests reproduce the observed blocking mechanism; they do not claim that
+every historical timeout had the same cause. The separate 500 ms cache-Put test
+limitation concerns durable blob storage and is not fixed by this change.
+
+Evidence is retained under `/build/richard/codex-1000/rpf-review-20261018/`:
+`baseline-gate.log`, `baseline-trace.1008595`, `pid-flush-observations.json`,
+`before-unit.log`, `before-production.log`, and their per-case logs.
+`gate-fixed.log` passes the full ordinary disk-backed gate on its first run after
+the change: 1,564 unit and 1,342 integration checks, both sixteen-case startup
+suites, link verification, publisher checks and the remaining ancillary suites.
+No tmpfs substitution, gate retry or wider deadline was used for this validation.
