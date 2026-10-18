@@ -370,6 +370,7 @@ test: $(BINDIR)/vcache_test $(BINDIR)/vcache_test_alloc $(BINDIR)/vcache $(TRACE
 	@PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/link_soak_capture_test.py $(BINDIR)/vcache
 	@CXX="$(CXX)" PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/cxx_scratch_test.py $(BINDIR)/vcache
 	@CC="$(CC)" PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/session_daemon_startup_test.py $(BINDIR)/vcache_test
+	@CC="$(CC)" PYTHONDONTWRITEBYTECODE=1 python3 $(TOP)/tests/daemon_ready_write_test.py $(BINDIR)/vcache
 
 # Not part of `test`: it downloads two kernel tarballs, wants ~10 GB of disk and
 # takes minutes. Pass options through with KERNEL_TEST_ARGS, e.g.

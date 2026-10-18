@@ -61,3 +61,31 @@ startup, run `bin/vcache_test --session-daemon-startup-probe` through
 `~/bin/build-limited`. Set `TMPDIR` under `/build/$USER/codex-1000/` first; compiler
 suites also need ccache/sccache directories removed from `PATH`. The retained
 `run.py` and `dc_verify.py` record the exact limited-execution commands used here.
+
+## Readiness notification writes
+
+The production daemon previously made one write to its readiness pipe and ignored
+the result. An interrupted write could lose the `R` (ready), `L` (lock held) or `E`
+(startup error) reply. The parent then saw EOF, even when the daemon was already
+listening. A short write could also truncate the error diagnostic.
+
+`SignalReady` now retries `EINTR` and advances through the remaining bytes after
+each positive write. Zero-byte writes and permanent errors end the attempt and
+close the pipe, so they cannot cause an infinite retry loop. A caller that has
+already closed its reader still does not kill the daemon. The readiness format,
+cache keys and startup deadlines are unchanged.
+
+`tests/daemon_ready_write_test.py` uses real production daemons, real pipes and a
+Linux preload shim restricted to the readiness descriptor. Five cases fail on
+`10df83d`: interrupted ready, lock-held and error replies; a short error reply;
+and a short error prefix followed by interruption. All five pass with the fix.
+Healthy startup, lock contention, full error output, zero progress, permanent
+write errors and a closed reader are controls. A separate mutation removing the
+stop-on-zero/error behavior makes those two bounded-completion checks fail.
+Every foreground daemon is stopped and reaped by the harness.
+
+This is a confirmed notification defect, not an attribution of the historical
+two-second startup timeouts. Those retained failures and their follow-up remain
+open. The normal gate includes both the earlier fixture tests and this production
+write suite. Evidence is under
+`/build/richard/codex-1000/daemon-ready-write-20261018/`.
