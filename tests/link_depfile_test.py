@@ -28,7 +28,8 @@ def main():
     compiler = shutil.which(args.compiler)
     if not compiler:
         raise RuntimeError('compiler not found: ' + args.compiler)
-    work = Path(tempfile.mkdtemp(prefix='vcache-link-depfile-'))
+    # Resolved, so a symlinked TMPDIR does not make every tree a root alias.
+    work = Path(tempfile.mkdtemp(prefix='vcache-link-depfile-')).resolve()
     print('link depfile evidence:', work, flush=True)
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('VCACHE_', 'CCACHE_')) and k != 'LD_PRELOAD'}
@@ -87,7 +88,8 @@ esac
           'real compiler escaped-colon target survives a warm cache hit')
 
     def run(label, tree='a', store='store', verify=False, name='main.o', direct=False,
-            cache=binary, variant=None, target='app', **settings):
+            cache=binary, variant=None, target='app', extra=(), linker=args.linker,
+            **settings):
         nonlocal sequence
         sequence += 1
         cwd = work / tree
@@ -96,7 +98,8 @@ esac
                        VCACHE_LINK_VERIFY=str(int(verify)), VCACHE_LOG=str(log),
                        LINK_DEPFILE_STORE=str(work / store), **settings)
         flags = variant or ['-Wl,--dependency-file=link.d']
-        cmd = [str(wrapper), '-fuse-ld=' + args.linker, *flags, str(cwd / name), '-o', target]
+        cmd = [str(wrapper), '-fuse-ld=' + linker, *flags, str(cwd / name),
+               *(str(cwd / path) for path in extra), '-o', target]
         result = subprocess.run(([] if direct else [cache]) + cmd, cwd=cwd, env=current,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 universal_newlines=True, timeout=45)
@@ -165,6 +168,38 @@ esac
     row = run('alias-verify', tree='alias', store='alias-store', verify=True)
     check('link verify: verified' not in row[2],
           'root alias cannot certify different replay path spelling')
+
+    # Sunbird's shape: CMake's `-Xlinker --dependency-file=` with mold, and an object
+    # named through the checkout's qbuild link to a shared export outside every root.
+    export = work / 'export' / 'qbuild'
+    export.mkdir(parents=True)
+    (work / 'reserve.c').write_text('int buildinfo_reserve;\n')
+    subprocess.run([compiler, '-c', str(work / 'reserve.c'), '-o', str(export / 'reserve.o')],
+                   env=env, check=True)
+    for tree in ('a', 'b'):
+        (work / tree / 'qbuild').symlink_to(export, target_is_directory=True)
+    sunbird = dict(variant=['-Xlinker', '--dependency-file=link.d'],
+                   extra=['qbuild/reserve.o'], linker='mold' if shutil.which('mold') else args.linker)
+    stored = run('export-cold', store='export-store', verify=True, **sunbird)
+    check('unsupported dependency file' not in stored[2] and
+          'link verify: candidate=' not in stored[2] and
+          any(work.glob('export-store/*/*.linkout')),
+          'in-checkout link to an export stores the link (' + sunbird['linker'] + ')')
+    export_control = run('export-fresh-b', tree='b', direct=True, **sunbird)
+    export_replay = run('export-replay-b', tree='b', store='export-store', **sunbird)
+    check(hit(export_replay) and rules(export_replay[0]) == rules(export_control[0]) and
+          str(work / 'b' / 'qbuild' / 'reserve.o') in export_replay[0] and
+          str(work / 'a') not in export_replay[0],
+          'export link replays depfile paths local to the second tree')
+    export_verified = run('export-verify-a', store='export-store', verify=True, **sunbird)
+    check('link verify: verified' in export_verified[2],
+          'repeated identical export link is verified')
+    # mold normalizes `..` away; bfd writes the spelling that leaves the root.
+    escaped = run('export-parent-cold', store='export-parent', verify=True,
+                  variant=sunbird['variant'], extra=['../export/qbuild/reserve.o'],
+                  linker='bfd')
+    check('unsupported dependency file; not storing' in escaped[2],
+          'parent component leaving the root still declines')
 
     for mode in ('mismatch', 'malformed', 'incomplete', 'mode'):
         store = 'fresh-' + mode
