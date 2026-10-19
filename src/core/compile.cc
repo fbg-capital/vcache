@@ -1155,8 +1155,8 @@ bool StoreCxxManifest(storage::CacheChain* cache, const std::string& manifest_ke
   bool reread_failed = false;
   const std::vector<CxxManifestState> reread =
       LoadCxxManifest(cache, manifest_key, cache_dir, media_failed, false, &reread_failed);
-  const std::vector<CxxManifestState> states = MergeManifestStates(
-      std::move(fresh), reread, loaded, &CxxManifestState::result_key);
+  const std::vector<CxxManifestState> states =
+      MergeCxxManifestStates(std::move(fresh), reread, loaded);
   storage::Blob blob;
   blob.dep_manifest = RenderCxxManifest(states);
   blob.has_dep_manifest = true;
