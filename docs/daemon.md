@@ -254,6 +254,10 @@ Everything lives under `<cache dir>/daemon/`, which the disk layer never walks:
 `<cache dir>/daemon/sock` would not fit, the socket moves to
 `/tmp/vcache-<uid>/<digest of the cache dir>.sock`.
 
+A daemon exits within about a second when its socket or its `lock` file is
+removed or replaced, for example when the cache directory is deleted; it
+removes a socket in `/tmp` on the way out.
+
 ## Running it under a service manager
 
 ```ini
