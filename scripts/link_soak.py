@@ -21,6 +21,10 @@ MAX_GAP_SECONDS = 36 * 60 * 60
 MIN_VERIFIED = 200
 CONTEXT_FIELDS = ('devtools_revision', 'sunbird_revision', 'compiler', 'linker',
                   'image', 'workload_evidence', 'reset_deployment_log')
+# One reset_deployment_log line per deployed vcache, as devtools' link-soak-daily.sh writes it.
+DEPLOYMENT_LINE = re.compile(r'^deployment: vcache (?P<version>[0-9]+(?:\.[0-9]+)+) '
+                             r'published (?P<published>\S+) commit (?P<commit>[0-9a-f]{7,40}) '
+                             r'(?P<fields>.*)$', re.MULTILINE)
 
 
 def parse_stats(text):
@@ -166,6 +170,28 @@ def validate_snapshot(snapshot):
     return start, end
 
 
+def logged_deployment(snapshot):
+    """Returns the logged deployment of this snapshot's binary and tracer, or None."""
+    for match in DEPLOYMENT_LINE.finditer(snapshot['context']['reset_deployment_log']):
+        words = match['fields'].split()
+        fields = dict(zip(words[::2], words[1::2]))
+        if (fields.get('binary_sha256') != snapshot['binary_sha256'] or
+                fields.get('tracer_sha256') != snapshot['tracer_sha256']):
+            continue
+        published = None
+        for layout in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ'):
+            try:
+                published = datetime.strptime(match['published'], layout).replace(
+                    tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        if published is None or published > utc_time(snapshot['started_utc']):
+            continue
+        return {'version': match['version'], 'published': match['published'],
+                'commit': match['commit']}
+    return None
+
+
 def check_window(snapshots):
     errors = []
     groups = {platform: [] for platform in PLATFORMS}
@@ -176,12 +202,13 @@ def check_window(snapshots):
         except (KeyError, TypeError, ValueError, AttributeError) as error:
             errors.append('invalid snapshot {}: {}'.format(index + 1, error))
     platforms = {}
-    stable_fields = ('epoch', 'hostname', 'store', 'store_identity', 'binary_sha256',
-                     'tracer_sha256', 'config')
+    stable_fields = ('epoch', 'hostname', 'store', 'store_identity', 'config')
+    deployed_fields = ('binary_sha256', 'tracer_sha256')
     for platform, rows in groups.items():
         problems = []
         totals = {name: 0 for name in COUNTERS}
         intervals = []
+        deployments = []
         if len(rows) < 2:
             problems.append('need at least two snapshots')
         for previous, current in zip(rows, rows[1:]):
@@ -203,6 +230,13 @@ def check_window(snapshots):
                 if name != 'link verified' and count > 0:
                     problems.append('nonzero ' + name)
                 totals[name] += count
+            changed = [name for name in deployed_fields if before[name] != after[name]]
+            # A logged release continues the window; a reset across it would hide outcomes.
+            deployment = logged_deployment(after) if changed else None
+            if deployment and all(delta[name] >= 0 for name in ('link verified', 'link mismatch')):
+                deployments.append(dict(deployment, after=after['started_utc']))
+            else:
+                problems.extend('window identity changed: ' + name for name in changed)
             intervals.append({'before': before['ended_utc'], 'after': after['started_utc'],
                               'delta': delta})
         elapsed = (rows[-1][1] - rows[0][2]).total_seconds() if len(rows) > 1 else 0
@@ -214,7 +248,8 @@ def check_window(snapshots):
             problems.append('fewer than 200 successful verifications')
         errors.extend(platform + ': ' + message for message in dict.fromkeys(problems))
         platforms[platform] = {'snapshots': len(rows), 'elapsed_seconds': elapsed,
-                               'delta': totals, 'intervals': intervals}
+                               'delta': totals, 'intervals': intervals,
+                               'deployments': deployments}
     if groups['host'] and groups['el10']:
         host = groups['host'][0][0]
         el10 = groups['el10'][0][0]

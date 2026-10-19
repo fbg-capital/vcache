@@ -120,6 +120,33 @@ class LinkSoakTest(unittest.TestCase):
                 self.assert_rejected('host: window identity changed: ' + name)
                 self.rows[4][name] = original
 
+    def deploy_mid_window(self, logged=True):
+        entry = ('deployment: vcache 1.12 published 2020-01-08T07:31:55.837Z commit 7fe1269ac40f '
+                 'installed 2020-01-08T07:32:21Z target fedora44 binary_sha256 ' + 'c' * 64 +
+                 ' tracer_sha256 ' + 'd' * 64)
+        for row in self.rows[16:]:
+            row['binary_sha256'], row['tracer_sha256'] = 'c' * 64, 'd' * 64
+            if logged:
+                row['context']['reset_deployment_log'] = 'operator history\n' + entry
+
+    def test_logged_deployment_continues_window(self):
+        self.deploy_mid_window()
+        report = link_soak.check_window(self.rows)
+        self.assertTrue(report['counter_window_complete'], report['errors'])
+        self.assertEqual(report['platforms']['host']['deployments'],
+                         [{'version': '1.12', 'published': '2020-01-08T07:31:55.837Z',
+                           'commit': '7fe1269ac40f', 'after': self.rows[16]['started_utc']}])
+
+    def test_unlogged_deployment(self):
+        self.deploy_mid_window(logged=False)
+        self.assert_rejected('host: window identity changed: binary_sha256')
+
+    def test_deployment_with_counter_decrease(self):
+        self.deploy_mid_window()
+        set_counters(self.rows[16], **{'link mismatch': 0})
+        self.assert_rejected('host: window identity changed: binary_sha256')
+        self.assertEqual(link_soak.check_window(self.rows)['platforms']['host']['deployments'], [])
+
     def test_daily_gap(self):
         del self.rows[4:6]
         self.assert_rejected('host: daily observation gap exceeds 36 hours')
