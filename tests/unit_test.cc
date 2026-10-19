@@ -2711,14 +2711,23 @@ bool LeaseStat(const SessionDaemon& server, const std::string& name, uint64_t ex
          std::strtoull(status.c_str() + row + name.size(), nullptr, 10) == expected;
 }
 
-bool PutLeaseBlob(const SessionDaemon& server, const std::string& key, int timeout_ms = 500,
-                  const LeasePeer* owner = nullptr) {
+// The daemon answers a Put, and wakes the key's waiters, only after the durable
+// store, and one fsync has taken over a second on a loaded disk. These tests
+// assert what the reply says, never how long the store took, so the bound only
+// turns a Put that never answers into a failure instead of a hang. It is the
+// daemon's own floor for a lease wait, which no single store reaches.
+constexpr int kPutReplyBoundMs = 30000;
+
+enum class PutReply { kNoAnswer, kRefused, kStored };
+
+PutReply PutLeaseReply(const SessionDaemon& server, const std::string& key,
+                       const LeasePeer* owner = nullptr) {
   storage::Blob blob;
   blob.object = "lease test object";
   std::string reply;
   const int fd = owner ? owner->PutSocket() : server.Hello(daemon::kProtocolVersion, &reply);
-  if (fd < 0) return false;
-  timeval timeout{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+  if (fd < 0) return PutReply::kNoAnswer;
+  timeval timeout{kPutReplyBoundMs / 1000, (kPutReplyBoundMs % 1000) * 1000};
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   daemon::Writer request;
   request.U8(static_cast<uint8_t>(daemon::Op::kPut));
@@ -2726,11 +2735,26 @@ bool PutLeaseBlob(const SessionDaemon& server, const std::string& key, int timeo
   request.Str(storage::SerializeBlob(blob));
   const bool answered = daemon::SendFrame(fd, request.data()) && daemon::RecvFrame(fd, &reply);
   ::close(fd);
+  if (!answered) return PutReply::kNoAnswer;
   daemon::Reader in(reply);
   uint8_t status = 0;
   uint8_t stored = 0;
-  return answered && in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kOk) &&
-         in.U8(&stored) && stored == 1;
+  return in.U8(&status) && status == static_cast<uint8_t>(daemon::Status::kOk) &&
+                 in.U8(&stored) && stored == 1
+             ? PutReply::kStored
+             : PutReply::kRefused;
+}
+
+bool PutLeaseBlob(const SessionDaemon& server, const std::string& key,
+                  const LeasePeer* owner = nullptr) {
+  return PutLeaseReply(server, key, owner) == PutReply::kStored;
+}
+
+// A refusal is an answer that did not store. A Put the daemon never answers is
+// neither, so a check expecting a refusal cannot pass on a slow store.
+bool PutLeaseRefused(const SessionDaemon& server, const std::string& key,
+                     const LeasePeer* owner = nullptr) {
+  return PutLeaseReply(server, key, owner) == PutReply::kRefused;
 }
 
 void TestKeyLeases() {
@@ -2753,7 +2777,7 @@ void TestKeyLeases() {
   Check(waiter.Acquire(key, 3000) &&
             PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000) &&
             waiter.NoReply(), "a second session waits instead of becoming a holder");
-  Check(PutLeaseBlob(server, key, 500, &holder), "holder key Put stores a production blob");
+  Check(PutLeaseBlob(server, key, &holder), "holder key Put stores a production blob");
   Check(waiter.Outcome(1), "holder Put wakes the waiter with stored");
   Check(waiter.last_reason == 0 && waiter.last_holder_pid == static_cast<uint64_t>(holder.pid),
         "stored reply carries the holder pid and no compile reason");
@@ -2808,7 +2832,7 @@ void TestKeyLeases() {
     std::unique_lock<std::mutex> lock(put_mutex);
     if (!put_ready.wait_for(lock, std::chrono::seconds(1), [&] { return put_allowed; })) return;
     lock.unlock();
-    put_stored = PutLeaseBlob(server, bound_key, 500, &next_holder);
+    put_stored = PutLeaseBlob(server, bound_key, &next_holder);
   });
   PollUntil([&] { return std::chrono::steady_clock::now() - bound_started >=
                         std::chrono::milliseconds(75); }, 200);
@@ -2817,8 +2841,10 @@ void TestKeyLeases() {
     put_allowed = true;
   }
   put_ready.notify_one();
-  const bool one_outcome = waiter.Outcome(255);
+  // The Put's reply follows the store and the lease completion, so once it is
+  // back the waiter's reply, whichever side won the race, is already on its way.
   concurrent_put.join();
+  const bool one_outcome = waiter.Outcome(255);
   Check(one_outcome && (waiter.last_outcome == 1 || waiter.last_outcome == 2) &&
             (waiter.last_reason == 0 || waiter.last_reason == 3) && put_stored &&
             waiter.NoReply(), "bound-versus-Put sends exactly one stored or bound reply");
@@ -2879,7 +2905,7 @@ void TestKeyLeases() {
   stored_waiter.Acquire(store_failed_key, 3000);
   Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
         "store-failure waiter is queued");
-  Check(!PutLeaseBlob(server, store_failed_key, 500, &next_holder) && stored_waiter.Outcome(2) &&
+  Check(PutLeaseRefused(server, store_failed_key, &next_holder) && stored_waiter.Outcome(2) &&
             stored_waiter.last_reason == 1, "a failed production store wakes compile with failure");
 
   const std::string shutdown_key(64, '3');
@@ -2932,7 +2958,7 @@ void TestKeyLeasePutClose() {
     Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
           "Put-close waiter queues before the store barrier");
     bool stored = false;
-    std::thread put([&] { stored = PutLeaseBlob(server, key, 3000, &holder); });
+    std::thread put([&] { stored = PutLeaseBlob(server, key, &holder); });
     const bool blocked = PollUntil([&] {
       return util::ReadFile(server.directory + "/put-log").value_or("").find(
                  "lease: test Put blocked " + key.substr(0, 16)) != std::string::npos;
@@ -2963,6 +2989,40 @@ void TestKeyLeasePutClose() {
           "Put barrier logs its bounded wait length");
     if (gate_fd >= 0) ::close(gate_fd);
   }
+}
+
+// The Put gate stands in for a durable store that outlives the 500 ms reply
+// window these tests once allowed: the lease must still complete from the
+// reply, and the waiter must wake exactly once, however long the disk took.
+void TestKeyLeaseSlowStore() {
+  Section("daemon::lease slow store");
+  SessionDaemon server(0, true, true);
+  LeasePeer holder(server), waiter(server);
+  const std::string key(64, '7');
+  const int gate_fd = ::open((server.directory + "/put-gate").c_str(), O_RDWR | O_NONBLOCK);
+  Check(gate_fd >= 0 && holder.Acquire(key, 3000) && holder.Outcome(0),
+        "slow-store holder acquires before the store barrier");
+  waiter.Acquire(key, 3000);
+  Check(PollUntil([&] { return LeaseStat(server, "leases waiting", 1); }, 1000),
+        "slow-store waiter queues before the store barrier");
+  PutReply reply = PutReply::kNoAnswer;
+  std::thread put([&] { reply = PutLeaseReply(server, key, &holder); });
+  const bool blocked = PollUntil([&] {
+    return util::ReadFile(server.directory + "/put-log").value_or("").find(
+               "lease: test Put blocked " + key.substr(0, 16)) != std::string::npos;
+  }, 1000);
+  const auto held_from = std::chrono::steady_clock::now();
+  PollUntil([&] { return std::chrono::steady_clock::now() - held_from >=
+                        std::chrono::milliseconds(700); }, 1000);
+  Check(blocked && waiter.NoReply() && LeaseStat(server, "leases held", 1),
+        "a store still running after 700 ms has woken nobody and keeps the lease held");
+  if (gate_fd >= 0) ::write(gate_fd, "s", 1);
+  put.join();
+  Check(reply == PutReply::kStored,
+        "a store that outlives the former 500 ms reply window is still reported stored");
+  Check(waiter.Outcome(1) && waiter.last_reason == 0 && waiter.NoReply(),
+        "and wakes the waiter exactly once with stored after the store completes");
+  if (gate_fd >= 0) ::close(gate_fd);
 }
 
 void TestMemoryAdmission() {
@@ -3222,7 +3282,7 @@ void TestAdmissionReview() {
               waiter.NoReply(250),
           "a 100 ms lease bound stays paused while its holder waits for memory");
     blocker.Close();
-    Check(holder.MemoryOutcome(0, 1000) && PutLeaseBlob(server, key, 500, &holder) &&
+    Check(holder.MemoryOutcome(0, 1000) && PutLeaseBlob(server, key, &holder) &&
               waiter.Outcome(1, 1000) && waiter.NoReply(),
           "a memory-queued holder's Put wakes exactly one stored lease reply");
   }
@@ -3629,11 +3689,11 @@ void TestLeaseReviewFixes() {
   const std::string blocker = server.config.disk.dir + "/66";
   const int blocker_fd = ::open(blocker.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
   if (blocker_fd >= 0) ::close(blocker_fd);
-  Check(blocker_fd >= 0 && !PutLeaseBlob(server, key) && waiter.NoReply() &&
+  Check(blocker_fd >= 0 && PutLeaseRefused(server, key) && waiter.NoReply() &&
             LeaseStat(server, "leases held", 1),
         "a failing foreign Put leaves the holder and waiter unchanged");
   Check(::rename(blocker.c_str(), (server.directory + "/blocked-shard").c_str()) == 0 &&
-            PutLeaseBlob(server, key, 500, &holder) && waiter.Outcome(1) && waiter.NoReply(),
+            PutLeaseBlob(server, key, &holder) && waiter.Outcome(1) && waiter.NoReply(),
         "the holder's Put alone wakes the waiter with exactly one stored reply");
 
   core::Config enabled = server.config;
@@ -3687,7 +3747,7 @@ void TestLeaseOrphanPut() {
   Check(holder.Outcome(0), "orphan-Put holder acquires without waiters");
   const int gate_fd = ::open((server.directory + "/put-gate").c_str(), O_RDWR | O_NONBLOCK);
   bool stored = false;
-  std::thread put([&] { stored = PutLeaseBlob(server, key, 3000, &holder); });
+  std::thread put([&] { stored = PutLeaseBlob(server, key, &holder); });
   Check(PollUntil([&] {
     return util::ReadFile(server.directory + "/put-log").value_or("").find(
                "lease: test Put blocked ") != std::string::npos;
@@ -3703,7 +3763,7 @@ void TestLeaseOrphanPut() {
   const std::string blocker = server.config.disk.dir + "/99";
   const int blocker_fd = ::open(blocker.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
   if (blocker_fd >= 0) ::close(blocker_fd);
-  Check(blocker_fd >= 0 && !PutLeaseBlob(server, key) && waiter.NoReply(),
+  Check(blocker_fd >= 0 && PutLeaseRefused(server, key) && waiter.NoReply(),
         "cached holder identity rejects a foreign failed Put after session destruction");
   if (blocker_fd >= 0) ::rename(blocker.c_str(), (server.directory + "/blocked-shard").c_str());
   if (gate_fd >= 0) ::write(gate_fd, "s", 1);
@@ -7711,6 +7771,7 @@ int main(int argc, char** argv) {
   TestKeyLeases();
   TestKeyLeaseValidation();
   TestKeyLeasePutClose();
+  TestKeyLeaseSlowStore();
   TestMemoryAdmission();
   TestRunSpawnCallback();
   TestLeaseReviewFixes();
