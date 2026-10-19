@@ -6710,19 +6710,46 @@ for cc in gcc clang; do
   check "$cc: the hit records a state from the -E run" \
     "$(grep -c 'cxx manifest: recorded a state from the preprocessor run' "$l")" "1"
   if [[ "$(uname -s)" == Linux ]]; then
-    check "$cc: from its trace, in place of the stale state, which named the same key" \
-      "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'cxx manifest: stored 1 states' "$l")" \
+    check "$cc: from its trace, beside the stale state, which named the same key" \
+      "$(grep -c 'cxx manifest: recorded from the trace' "$l")/$(grep -c 'cxx manifest: stored 2 states' "$l")" \
       "1/1"
   else
-    check "$cc: from its depfile (no tracer here), in place of the stale state" \
-      "$(grep -c 'cxx manifest: stored 1 states' "$l")" "1"
+    check "$cc: from its depfile (no tracer here), beside the stale state" \
+      "$(grep -c 'cxx manifest: stored 2 states' "$l")" "1"
   fi
   check "$cc: --show-stats counts it" "$(pphit_recorded)" "1"
   l=$(mf_log "pphit3-$cc"); mf_pphit "$cc" "$l"
   check "$cc: the next compile skips the preprocessor" \
-    "$(grep -c 'state 1 of 1; preprocessor skipped' "$l")/$(grep -c '\] preprocess: ' "$l" || true)" \
+    "$(grep -c 'state 1 of 2; preprocessor skipped' "$l")/$(grep -c '\] preprocess: ' "$l" || true)" \
     "1/0"
   check "$cc: and a manifest hit is not counted as recording" "$(pphit_recorded)" "1"
+done
+
+# A comment edit preprocesses to the same text, so its state names the key the
+# state before it named. Both stay: after a revert the first one hits again.
+for cc in gcc clang; do
+  if ! command -v "$cc" >/dev/null 2>&1; then
+    skipped "$cc: not installed"
+    continue
+  fi
+  reset_cache
+  printf '#define SIX 6\n' > "$WORK/mf-pphit/h.h"
+  cp "$WORK/mf-pphit/h.h" "$WORK/mf-pphit/h.h.orig"
+  mf_pphit "$cc" "$(mf_log "revert1-$cc")" VCACHE_RECACHE=1
+  l=$(mf_log "revert2-$cc"); mf_pphit "$cc" "$l"
+  check "$cc revert: the second compile hits through the manifest" \
+    "$(manifest_hits)/$(grep -c '\] preprocess: ' "$l" || true)" "1/0"
+  echo '/* edited */' >> "$WORK/mf-pphit/h.h"
+  l=$(mf_log "revert3-$cc"); mf_pphit "$cc" "$l"
+  check "$cc revert: a comment line appended is a preprocessor hit, not a compile" \
+    "$(pphit_recorded)/$(misses)" "1/1"
+  check "$cc revert: which keeps the state from before the edit" \
+    "$(grep -c 'cxx manifest: stored 2 states' "$l")" "1"
+  cp "$WORK/mf-pphit/h.h.orig" "$WORK/mf-pphit/h.h"
+  l=$(mf_log "revert4-$cc"); mf_pphit "$cc" "$l"
+  check "$cc revert: restoring the header hits that state through the manifest" \
+    "$(manifest_hits)/$(grep -c '\] preprocess: ' "$l" || true)" "2/0"
+  check "$cc revert: and records nothing new" "$(pphit_recorded)" "1"
 done
 
 # With tracing off, gcc's -E run records from its depfile alone.

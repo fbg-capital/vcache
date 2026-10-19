@@ -40,6 +40,14 @@ struct CxxManifestState {
   std::vector<std::string> absent;
 };
 
+// MergeManifestStates for C/C++ states, which are told apart by what they
+// record, not by their result key. Many sets of header contents preprocess to
+// one text: after a comment edit and its revert the state from before the edit
+// is the one that matches again, so it must survive the edit's state.
+std::vector<CxxManifestState> MergeCxxManifestStates(CxxManifestState fresh,
+                                                     std::vector<CxxManifestState> reread,
+                                                     const std::vector<CxxManifestState>& loaded);
+
 std::string RenderCxxManifest(const std::vector<CxxManifestState>& states);
 
 // Returns false on any malformed line; the caller then starts a new manifest.

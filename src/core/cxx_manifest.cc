@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <map>
 #include <set>
+#include <tuple>
 #include <utility>
 
 #include "core/preprocessed.h"
@@ -66,6 +67,15 @@ std::string CanonicalizeArg(const std::string& arg, const RootMap& roots) {
 }
 
 }  // namespace
+
+std::vector<CxxManifestState> MergeCxxManifestStates(CxxManifestState fresh,
+                                                     std::vector<CxxManifestState> reread,
+                                                     const std::vector<CxxManifestState>& loaded) {
+  const auto recorded_inputs = [](const CxxManifestState& state) {
+    return std::tie(state.files, state.absent);
+  };
+  return MergeManifestStates(std::move(fresh), std::move(reread), loaded, recorded_inputs);
+}
 
 // A header line, then per state a "state <result key>" line followed by one
 // RenderManifestFile line per file and one "absent <path>" line per absent
