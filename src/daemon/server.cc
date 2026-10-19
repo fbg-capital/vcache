@@ -443,6 +443,9 @@ class Server {
   int IdleLimitSeconds() const;
   void StartJobserver();
   void TickJobserver();
+  // False once the lock file this process holds is no longer the one at its
+  // path: the cache directory was deleted, or its state directory replaced.
+  bool HoldsLockAtPath() const;
 
   const core::Config config_;
   const std::string state_dir_;
@@ -563,6 +566,14 @@ bool Server::AcquireLock(std::string* error) {
   util::WriteFileAtomic(state_dir_ + "/pid", std::to_string(::getpid()) + "\n",
                         /*durable=*/false);
   return true;
+}
+
+bool Server::HoldsLockAtPath() const {
+  struct stat held;
+  struct stat at_path;
+  return ::fstat(lock_fd_, &held) == 0 &&
+         ::lstat((state_dir_ + "/lock").c_str(), &at_path) == 0 &&
+         held.st_dev == at_path.st_dev && held.st_ino == at_path.st_ino;
 }
 
 bool Server::Listen(std::string* error) {
@@ -1937,12 +1948,28 @@ int Server::Run(int ready_fd) {
   SignalReady(&ready_fd, 'R', "");
 
   while (!g_signalled.load() && !stop_requested_.load()) {
-    // The timeout only paces the idle check; requests and wake-ups end the
+    // The timeout only paces the idle and lock checks; requests and wake-ups end the
     // wait immediately.
     pollfd pfds[2] = {{listen_fd_, POLLIN, 0}, {wake[0], POLLIN, 0}};
     const int rc = ::poll(pfds, 2, 1000);
     if (rc < 0 && errno != EINTR) {
       log_.Line(std::string("poll: ") + std::strerror(errno));
+      break;
+    }
+    // Someone deleted the cache directory, or another daemon took the path
+    // over. Either way no client can reach this one any more, and lingering
+    // until the idle timeout would only hold its credentials and threads. The
+    // socket alone does not tell: a cache path too long for a socket address
+    // puts it in /tmp, which outlives the cache directory, so the lock is
+    // checked too. Checked on every wake so a steady stream of requests to a
+    // daemon whose cache is gone cannot postpone it.
+    struct stat st;
+    if (::lstat(socket_path_.c_str(), &st) != 0 || st.st_ino != socket_inode_) {
+      log_.Line("socket " + socket_path_ + " was removed or replaced; exiting");
+      break;
+    }
+    if (!HoldsLockAtPath()) {
+      log_.Line("lock " + state_dir_ + "/lock was removed or replaced; exiting");
       break;
     }
     if (rc > 0 && (pfds[1].revents & POLLIN)) {
@@ -1973,14 +2000,6 @@ int Server::Run(int ready_fd) {
       counters_.connections++;
       std::thread([this, fd] { Serve(fd); }).detach();
       continue;
-    }
-    // Someone deleted the cache directory, or another daemon took the path
-    // over. Either way no client can reach this one any more, and lingering
-    // until the idle timeout would only hold its credentials and threads.
-    struct stat st;
-    if (::lstat(socket_path_.c_str(), &st) != 0 || st.st_ino != socket_inode_) {
-      log_.Line("socket " + socket_path_ + " was removed or replaced; exiting");
-      break;
     }
     if (Idle()) {
       log_.Line("idle for " + std::to_string(IdleLimitSeconds()) + " s; exiting");

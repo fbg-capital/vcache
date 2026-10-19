@@ -2415,6 +2415,21 @@ for _ in $(seq 1 30); do kill -0 "$DPID" 2>/dev/null || break; sleep 0.1; done
 check "a daemon whose cache directory is deleted exits" \
   "$(kill -0 "$DPID" 2>/dev/null && echo running || echo exited)" "exited"
 
+# A cache path too long for a socket address puts the socket in /tmp instead,
+# where deleting the cache directory leaves it in place. The daemon must still
+# notice that its cache is gone, and take the stray socket with it.
+LONG_CACHE="$WORK/$(printf 'long%.0s' {1..30})/cache"
+LONG_SOCK=$(VCACHE_DIR="$LONG_CACHE" "$VCACHE" --start-daemon | sed -n 's/.* started on //p')
+DPID=$(VCACHE_DIR="$LONG_CACHE" daemon_pid)
+check "a long cache path puts the daemon socket outside the cache directory" \
+  "$([[ -S "$LONG_SOCK" && "$LONG_SOCK" != "$LONG_CACHE"/* ]] && echo yes)" "yes"
+rm -rf "$LONG_CACHE"
+for _ in $(seq 1 30); do kill -0 "$DPID" 2>/dev/null || break; sleep 0.1; done
+check "a daemon whose cache directory is deleted exits when its socket is elsewhere" \
+  "$(kill -0 "$DPID" 2>/dev/null && echo running || echo exited)" "exited"
+check "and removes that socket" "$([[ -e "$LONG_SOCK" ]] && echo present || echo gone)" "gone"
+[[ -n "$DPID" ]] && kill "$DPID" 2>/dev/null
+
 # Idle exit.
 VCACHE_DAEMON_IDLE_TIMEOUT=1 "$VCACHE" --start-daemon >/dev/null
 sleep 2.5
