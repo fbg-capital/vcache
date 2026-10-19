@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -128,7 +129,23 @@ def run(binary, work):
                    if not key.startswith('VCACHE_') and key != 'LD_PRELOAD'}
     environment.update(VCACHE_CONFIG=str(config), VCACHE_DAEMON='auto', LC_ALL='C',
                        VCACHE_CACHE_SIZE='1G', VCACHE_DAEMON_IDLE_TIMEOUT='0')
+    # An explicit VCACHE_DAEMON_SOCKET gets no /tmp fallback from the daemon,
+    # so it must fit a sockaddr_un by itself; a long TMPDIR would otherwise turn
+    # every case into "socket path too long". The store and the logs stay under
+    # `work`, whose length does not matter.
     socket_path = work / 's'
+    socket_dir = None
+    if len(os.fsencode(socket_path)) >= 108:
+        socket_dir = Path(tempfile.mkdtemp(prefix='ready-write-', dir='/tmp'))
+        socket_path = socket_dir / 's'
+    try:
+        return run_cases(binary, work, shim, environment, socket_path)
+    finally:
+        if socket_dir is not None:
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+def run_cases(binary, work, shim, environment, socket_path):
     cases = ['healthy', 'ready-eintr', 'lock', 'lock-eintr', 'error-control',
              'error-eintr', 'error-short', 'error-partial-interrupted',
              'zero', 'failed', 'closed-reader', 'flock-interrupted',
