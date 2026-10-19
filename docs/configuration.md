@@ -280,6 +280,14 @@ Dependencies must resolve to traced inputs; unsupported rule shapes or ambiguous
 root spellings also decline the entire cached link. The successful fresh link
 and its original files are retained, without storing a partial result.
 
+A dependency spelled below a root, with no `.` or `..` component, is stored by
+that spelling even when a link inside the checkout resolves it outside every
+root, as Sunbird's `qbuild` link to a shared export does: the destination
+checkout's linker opens its own spelling of that path, and the key hashed it.
+A spelling is ambiguous when it leaves a root through `..` (GNU ld keeps the
+component; mold normalizes it away) or reaches into a root through an alias
+outside it; either declines the link. `VCACHE_LOG` names the refused path.
+
 Link outputs live content-addressed in the local disk cache and are verified
 against their recorded digest before every hit. S3 may carry the small manifest
 and result metadata, but link-output sidecars are deliberately local in this

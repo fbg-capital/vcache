@@ -791,7 +791,10 @@ equality or authorize repair. Dependency sidecars hold parsed rules with canonic
 paths. Replay authenticates those bytes before localizing them; verification
 snapshots the digest of that exact localized representation and compares fresh
 rules with the same layout normalization. Binary and map checks remain exact.
-Unsupported linker escaping or rules decline the whole cached link. Link key
+Unsupported linker escaping or rules, and dependencies that leave a root through
+`..` or enter one through an outside alias, decline the whole cached link; a
+dependency spelled inside a root that a checkout link resolves elsewhere is
+stored by its spelling. Link key
 version 6 excludes old raw dependency sidecars; the manifest format is unchanged. See [verification configuration](configuration.md#verifying-link-hits)
 for counters, read-only/recache behavior and the cost of this opt-in mode.
 

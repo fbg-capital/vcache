@@ -283,6 +283,15 @@ bool SupportedLinkDepfile(const DepFile& dep, const std::string& output) {
   return true;
 }
 
+// Roots are real directories, so an absolute spelling below one with no `.` or
+// `..` component can only leave every root through a link inside the checkout
+// (Sunbird's qbuild points at a shared export). Its canonical spelling localizes
+// to the destination checkout's own spelling of that entry, which is what that
+// checkout's linker opens and its key hashed.
+bool SpelledInsideRoot(const std::string& input, const RootMap& roots) {
+  return roots.Covers(input) && util::AbsoluteLexical(input) == input;
+}
+
 bool ReadFreshLinkDepfiles(const args::LinkArgs& parsed, const RootMap& roots,
                           const std::string& trace_log, const LinkTrace& trace,
                           LinkDepfiles* local, LinkDepfiles* canonical) {
@@ -293,7 +302,10 @@ bool ReadFreshLinkDepfiles(const args::LinkArgs& parsed, const RootMap& roots,
   // only parsed tokens could accept a split or silently unescaped filename.
   for (const auto* paths : {&records.reads, &records.tools, &records.loaded}) {
     for (const auto& path : *paths) {
-      if (!SupportedLinkDepPath(path)) return false;
+      if (!SupportedLinkDepPath(path)) {
+        VCACHE_LOG("link depfile: traced path needs escaping: " + path);
+        return false;
+      }
     }
   }
   std::set<std::string> observed;
@@ -305,14 +317,24 @@ bool ReadFreshLinkDepfiles(const args::LinkArgs& parsed, const RootMap& roots,
   for (const auto& path : parsed.dependency_outputs) {
     const auto text = util::ReadFile(path);
     auto dep = text ? ParseDepFile(*text) : std::nullopt;
-    if (!dep || !SupportedLinkDepfile(*dep, parsed.output)) return false;
+    if (!dep || !SupportedLinkDepfile(*dep, parsed.output)) {
+      VCACHE_LOG("link depfile: unsupported shape: " + path);
+      return false;
+    }
     for (const auto& input : dep->rules.front().prerequisites) {
       const auto real = util::RealPath(input);
-      if (!real || !observed.contains(*real)) return false;
+      if (!real || !observed.contains(*real)) {
+        VCACHE_LOG("link depfile: prerequisite was not traced: " + input);
+        return false;
+      }
       // A root alias or a parent component must not leave a checkout's real
       // input behind as an apparently external, unremapped dependency.
       if (input.front() == '/' && (roots.Covers(input) || roots.Covers(*real)) &&
-          roots.Canonicalize(input) != roots.Canonicalize(*real)) return false;
+          roots.Canonicalize(input) != roots.Canonicalize(*real) &&
+          !SpelledInsideRoot(input, roots)) {
+        VCACHE_LOG("link depfile: ambiguous root spelling: " + input + " is " + *real);
+        return false;
+      }
     }
     local->emplace(path, RenderDepFile(*dep));
     RemapDepFile(&*dep, roots, MapDirection::kCanonicalize);
