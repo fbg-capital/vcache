@@ -5829,9 +5829,17 @@ void TestRunRusage() {
   Check(!helper.empty(), "bin/vcache_test_alloc exists");
   if (helper.empty()) return;
 
+  // ru_maxrss is read from per-CPU counters that each hold up to
+  // max(32, 2 * cpus) pages not yet folded into the total, so a child that
+  // touched 64 MiB can report a batch less for every CPU it ran on. Four
+  // batches cover the migrations of a short run: on a 128-CPU host 4 of 400
+  // loaded runs fell short, by one or two batches.
+  const long rss_batch_kb = std::max(32L, 2 * ::sysconf(_SC_NPROCESSORS_ONLN)) * 4;
+  const uint64_t rss_floor_kb = 65536 - static_cast<uint64_t>(4 * rss_batch_kb);
   const util::ProcResult big = util::Run({helper, "64"});
-  Check(big.exit_code == 0 && big.max_rss_kb >= 65536,
-        "64 MiB child reports max_rss_kb >= 65536 (got " + std::to_string(big.max_rss_kb) + ")");
+  Check(big.exit_code == 0 && big.max_rss_kb >= rss_floor_kb,
+        "64 MiB child reports max_rss_kb >= " + std::to_string(rss_floor_kb) + " (got " +
+            std::to_string(big.max_rss_kb) + ")");
   Check(big.wall_ms < 10000, "64 MiB child wall_ms is below 10000");
 
   const util::ProcResult small = util::Run({helper, "1"});
