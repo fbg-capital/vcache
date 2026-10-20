@@ -60,8 +60,11 @@ counter resets, store changes, daemon restarts and failures in
 `reset-deployment.log` by hand, as dated lines.
 
 Read the log with `tail /build/$USER/link-soak/link-soak-daily.log` or
-`journalctl --user -u link-soak-daily`. `systemctl --user list-timers
-link-soak-daily.timer` shows the next run.
+`journalctl --user -u link-soak-daily`. After each published snapshot the log
+gives every counter with its change since the platform's previous snapshot,
+for example `link mismatch 11 (+0) since 20261019-host`: the total carries the
+store's history from before the epoch, and only the change can reject the
+window. `systemctl --user list-timers link-soak-daily.timer` shows the next run.
 
 To collect by hand, for example in a new evidence root, use the same script:
 
