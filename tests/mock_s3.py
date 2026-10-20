@@ -234,6 +234,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
+        # MOCK_S3_HOLD_PUT_DIR=<dir> parks every PUT until <dir>/release exists,
+        # after noting the object's storage name in <dir>/puts.log, so a test
+        # can hold an upload in flight for as long as it needs and count the
+        # uploads that arrived, instead of racing a latency against its own
+        # process spawns.
+        hold_dir = os.environ.get("MOCK_S3_HOLD_PUT_DIR")
+        if hold_dir:
+            with open(os.path.join(hold_dir, "puts.log"), "a", encoding="ascii") as log:
+                log.write(os.path.basename(path) + "\n")
+            release = os.path.join(hold_dir, "release")
+            deadline = time.monotonic() + 30
+            while not os.path.exists(release):
+                if time.monotonic() > deadline:
+                    self.send_error(503, "held PUT was never released")
+                    return
+                time.sleep(0.01)
         # The object appears when the request finishes, not when it arrives, so
         # a slow upload that started first can still be the value left behind.
         if apply_after:

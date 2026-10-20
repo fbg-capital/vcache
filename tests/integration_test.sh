@@ -2570,8 +2570,10 @@ fi
 # --------------------------------------------------------------------------
 section "11b2. A second store during an upload is the one S3 keeps"
 
-# Two stores of one key, the second while the first upload is still in the
-# mock's latency. The bucket must end on the second value.
+# Two stores of one key while its upload is still waiting behind another key's
+# upload, which the mock holds in flight until the test releases it. One upload
+# thread keeps the first store waiting, so the second store merges into it
+# rather than being queued again. The bucket must end on the second value.
 if ! command -v python3 >/dev/null 2>&1; then
   skipped "rewrite upload test: python3 not installed"
 else
@@ -2579,8 +2581,10 @@ else
   "$VCACHE" --stop-daemon >/dev/null 2>&1 || true
   S3PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
   S3DIR="$WORK/rewrite-s3"
+  HOLD_DIR="$WORK/rewrite-hold"
+  mkdir -p "$HOLD_DIR"
   stop_s3
-  MOCK_S3_LATENCY_MS=500 python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
+  MOCK_S3_HOLD_PUT_DIR="$HOLD_DIR" python3 "$TOP/tests/mock_s3.py" "$S3PORT" "$S3DIR" &
   S3PID=$!
   for _ in $(seq 1 50); do
     python3 -c "
@@ -2598,15 +2602,37 @@ except Exception: sys.exit(1)
   export VCACHE_S3_PATH_STYLE=1
   export VCACHE_S3_REGION=us-east-1
   export VCACHE_DAEMON=on
+  export VCACHE_DAEMON_UPLOAD_THREADS=1
   "$VCACHE" --start-daemon >/dev/null
+  blocker_key=11111111111111111111111111111111
   rewrite_key=22222222222222222222222222222222
+  blocker_obj="${blocker_key:0:2}__${blocker_key:2}"
+  rewrite_obj="${rewrite_key:0:2}__${rewrite_key:2}"
+  printf 'blocker' | "$VCACHE" --test-put "$blocker_key"
+  for _ in $(seq 1 100); do
+    grep -q "$blocker_obj" "$HOLD_DIR/puts.log" 2>/dev/null && break
+    sleep 0.1
+  done
+  check "the blocker upload has reached s3 and is held there" \
+    "$(grep -c "$blocker_obj" "$HOLD_DIR/puts.log" 2>/dev/null)" "1"
   printf 'manifest-v1' | "$VCACHE" --test-put "$rewrite_key"
   printf 'manifest-v2' | "$VCACHE" --test-put "$rewrite_key"
   check "a merged re-put is not a second queued upload" \
-    "$(daemon_stat 'uploads queued')" "1"
+    "$(daemon_stat 'uploads queued')" "2"
+  check "the merged store is one pending upload behind the blocker" \
+    "$(daemon_stat 'pending')" "2"
+  touch "$HOLD_DIR/release"
+  for _ in $(seq 1 100); do
+    if [[ "$(daemon_stat 'pending')" == "0" ]]; then break; fi
+    sleep 0.1
+  done
+  check "the merged key was uploaded once" \
+    "$(grep -c "$rewrite_obj" "$HOLD_DIR/puts.log" 2>/dev/null)" "1"
+  check "the drain completed the blocker and the merged store" \
+    "$(daemon_stat 'completed')" "2"
   "$VCACHE" --stop-daemon >/dev/null
-  rewrite_obj="$S3DIR/${rewrite_key:0:2}__${rewrite_key:2}"
-  check "the bucket object is the second store" "$(cat "$rewrite_obj" 2>/dev/null)" "manifest-v2"
+  check "the bucket object is the second store" "$(cat "$S3DIR/$rewrite_obj" 2>/dev/null)" "manifest-v2"
+  unset VCACHE_DAEMON_UPLOAD_THREADS
   stop_s3
 
   # One upload thread, so a slow put stays in flight or queued on purpose.
