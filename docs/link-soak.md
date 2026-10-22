@@ -88,6 +88,35 @@ recorded with its status and diagnostic; persisted counters are still usable.
 Failed collections retain their partial directory and do not publish a snapshot.
 Existing evidence directories are refused.
 
+## Nightly el10 builds
+
+A link is verified only when a later build repeats its exact inputs, and el10
+builds are rare. devtools' `link-soak-el10-builds.timer` supplies them.
+`host-setup-buildcache.sh` installs it with `~/bin/link-soak-el10-builds.sh`
+(source: devtools `scripts/linksoak/`). It runs at 03:00 through `build-limited`,
+keeps its own sunbird worktree `/build/$USER/link-soak/el10-builds/sunbird`, and
+fetches origin. For each first-parent commit of `origin/main` after `last-built`
+(the last 7 days on the first run), oldest first, it runs `scripts/siblings.sh
+link`, then `FBG_VCACHE_LINK=verify ./build.sh --clean` twice in el10. No commit
+starts after 06:45 (`LINK_SOAK_BUILD_DEADLINE`), and the unit stops after 4
+hours. A commit whose build fails is retried once the next night.
+
+`/build/$USER/link-soak/el10-builds/runs.tsv` has one row per build: start time,
+sha, build (1 or 2), exit status, elapsed seconds, the link-verification log the
+build named, and that log's links, verified, mismatch and not-stored counts,
+counted with the same patterns as the daily collector. A `-` means the build
+named no log (it failed before linking, or vcache was off). The second build of
+a commit should verify every link whose inputs carry no per-build stamp; the
+first verifies only links the previous commit left unchanged. A mismatch also
+gets its own `MISMATCH: <sha> build <n>: ... in <log>` line in
+`link-soak-el10-builds.log` there, and the run exits non-zero.
+
+    column -t -s $'\t' /build/$USER/link-soak/el10-builds/runs.tsv | tail
+
+The builds write their logs into the el10 store's `link-verification/`, so the
+next el10 snapshot's `workload_evidence` lists each of them, and its counter line
+shows a new mismatch as `link mismatch N (+1)`, which rejects the window.
+
 ## Check the observation window
 
 Pass every snapshot for the chosen window, in chronological order **within each
