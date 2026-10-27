@@ -14,8 +14,10 @@ actually used that launcher.
 ## Collect daily snapshots
 
 devtools' `link-soak-daily.timer` collects them. `host-setup-buildcache.sh` installs
-it with `~/bin/link-soak-daily.sh` (source: devtools `scripts/linksoak/`). Once a
-day at 04:30, up to 30 minutes later and caught up after downtime, it runs
+it with `~/bin/link-soak-daily.sh` (source: devtools `scripts/linksoak/`) and
+enables it, with the nightly el10 build timer below, only for a soak:
+`host-setup-buildcache.sh --link-soak on` starts one and `--link-soak off` ends it.
+Once a day at 04:30, up to 30 minutes later and caught up after downtime, it runs
 `build-limited link-soak-daily.sh`. The script loads Sunbird's vcache environment
 with `FBG_VCACHE_LINK=verify`, on the host and through `container.run.sh el10`, and
 runs `link_soak.py snapshot` once per platform. The evidence root is
@@ -96,8 +98,9 @@ builds are rare. devtools' `link-soak-el10-builds.timer` supplies them.
 (source: devtools `scripts/linksoak/`). It runs at 03:00 through `build-limited`,
 keeps its own sunbird worktree `/build/$USER/link-soak/el10-builds/sunbird`, and
 fetches origin. For each first-parent commit of `origin/main` after `last-built`
-(the last 7 days on the first run), oldest first, it runs `scripts/siblings.sh
-link`, then `FBG_VCACHE_LINK=verify ./build.sh --clean` twice in el10. No commit
+(the last 7 days on the first run), oldest first, it links the commit's siblings
+(its `scripts/siblings.sh` or `scripts/siblings`, else the host's `siblings`),
+then runs `FBG_VCACHE_LINK=verify ./build.sh --clean` twice in el10. No commit
 starts after 06:45 (`LINK_SOAK_BUILD_DEADLINE`), and the unit stops after 4
 hours. A commit whose build fails is retried once the next night.
 
@@ -218,3 +221,22 @@ that changes.
 |---|---|---:|---:|---:|
 | Host | `20261019-host` | 1,048 | 11 | 0 |
 | EL10 | `20261019-el10` | 1,121 | 0 | 0 |
+
+## Outcome of the 2026-10 soak
+
+The owner ended the soak on 2026-10-27, after 8.8 of the 14 days, on the
+checker's report over the 20 snapshots `20261018` to `20261027`: both platforms
+were far past the 200-verification threshold with no mismatch, no verification
+error, no counter reset and the two logged deployments (1.12 and 1.13) tolerated.
+The nightly el10 builds, started 2026-10-23, supplied most of el10's count.
+
+| Platform | Link verified since the epoch | Link mismatch | Link verify error |
+|---|---:|---:|---:|
+| Host | +556 | +0 | +0 |
+| EL10 | +1,256 | +0 | +0 |
+
+The decision and the counters are in `reset-deployment.log` and on vcache-trk.3.
+Both timers were disabled with `host-setup-buildcache.sh --link-soak off`.
+`FBG_VCACHE_LINK` stays `off` by default; ordinary link hits remain opt-in per
+build with `FBG_VCACHE_LINK=on`. The audit controls and the controlled
+ordinary-hit build that vcache-trk.3 also asked for were not run.
