@@ -237,8 +237,6 @@ The nightly el10 builds, started 2026-10-23, supplied most of el10's count.
 
 The decision and the counters are in `reset-deployment.log` and on vcache-trk.3.
 Both timers were disabled with `host-setup-buildcache.sh --link-soak off`.
-`FBG_VCACHE_LINK` stays `off` by default; ordinary link hits remain opt-in per
-build with `FBG_VCACHE_LINK=on`.
 
 The same evening, a controlled ordinary-hit comparison on sunbird 8f9e01b: four
 clean builds per platform (`off`, `off`, `on`, `on`), host and el10. Sunbird's
@@ -249,3 +247,12 @@ platforms, including the 3 that the `on` builds served from the cache. A host
 `run_tests.sh --audit` over a second `on` build with tests, in which 87 of 191
 links were cache hits (85 test executables), passed all 510 ids three times.
 The details are on vcache-trk.3.
+
+On that evidence the owner turned ordinary link hits on for zeus the same day:
+`~/.config/build-limited.conf` went from `vcache_link=verify` to `vcache_link=on`,
+so every build through `build-limited`, host and el10, now serves eligible link
+hits (devtools `docs/host-setup.md`, "Opt-in link verification"). `exportVcacheEnv`
+itself still defaults to `off`, so a build outside the limiter links fresh, and
+prodd's `deploy-sources.sh` exports `FBG_VCACHE_LINK=off` before every deploy
+build, so a shipped binary is always a fresh link. Any mismatch found later goes
+through the reset procedure above: the next soak starts a new epoch.
