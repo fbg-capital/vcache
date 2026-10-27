@@ -238,5 +238,14 @@ The nightly el10 builds, started 2026-10-23, supplied most of el10's count.
 The decision and the counters are in `reset-deployment.log` and on vcache-trk.3.
 Both timers were disabled with `host-setup-buildcache.sh --link-soak off`.
 `FBG_VCACHE_LINK` stays `off` by default; ordinary link hits remain opt-in per
-build with `FBG_VCACHE_LINK=on`. The audit controls and the controlled
-ordinary-hit build that vcache-trk.3 also asked for were not run.
+build with `FBG_VCACHE_LINK=on`.
+
+The same evening, a controlled ordinary-hit comparison on sunbird 8f9e01b: four
+clean builds per platform (`off`, `off`, `on`, `on`), host and el10. Sunbird's
+post-link `buildinfo patch` rewrites `.note.buildinfo` and `.note.buildsig` in
+every output every build, so whole files never match; with those two sections
+zeroed, all 11 link outputs were byte-identical across the four builds on both
+platforms, including the 3 that the `on` builds served from the cache. A host
+`run_tests.sh --audit` over a second `on` build with tests, in which 87 of 191
+links were cache hits (85 test executables), passed all 510 ids three times.
+The details are on vcache-trk.3.
