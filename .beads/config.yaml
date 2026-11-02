@@ -2,3 +2,6 @@
 # issue_prefix: vcache
 # default_priority: 2
 # default_type: task
+
+# beads-session lands rows onto this branch (vcache has no main).
+land_branch: fbg

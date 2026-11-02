@@ -305,3 +305,22 @@ sends it.
 5. **Deploy** a merged change that ends with `Deploy: vcache`: bring `~/fbg/vcache` to `fbg`, and the next build rebuilds
    `dist/` (see "Installed binaries").
 6. **Publish** every merge to `fbg` with `scripts/anvil-publish.sh` (see "Publishing to anvil").
+
+## Beads
+
+Issues live in beads (`br`). The rules are in `../devtools/docs/beads-agent-rules.md`: A1-A7 for agent trees, 1-9
+for a tree a person works in. vcache's id prefix is `vcache`.
+
+- An agent tree (a linked worktree under `/build/$USER/claude-tmp`) uses a beads session DB outside every tree. A
+  plain `git worktree add` there attaches it to a new one-tree session; a swarm's trees come from
+  `agent-tree add vcache <name> --session <swarm session>`, so their beads match their files. Run
+  `beads-session check .` before any `br` command, pass `--actor <name>` on every write, and never commit
+  `.beads/issues.jsonl` from an agent tree (pre-commit unstages it with a WARNING).
+- The orchestrator runs `beads-session --repo ~/fbg/vcache status --all` at swarm start. Once the swarm's code is on
+  `fbg`, it runs `beads-session --repo ~/fbg/vcache land <session>`, then `agent-tree remove <tree>` for each tree.
+- A tree a person works in has its own `.beads/beads.db`, made at checkout (else
+  `scripts/git-hooks/beads-seed-own`). Commit normally: pre-commit flushes and stages the export, and pre-commit and
+  pre-push refuse one that drops or rolls back an issue (`BEADS_REGRESSION_ALLOW=<id>,<id>` needs the owner's
+  approval).
+- The hooks are devtools' scripts, run through `scripts/git-hooks/beads-stub` from the devtools checkout beside this
+  one; in a new clone, `python3 ../devtools/scripts/install-git-hooks.py install --repo .` routes them.

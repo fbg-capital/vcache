@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# pre-push: devtools' beads regression check (scripts/git-hooks/beads-regression-check, a link to beads-stub) refuses a
+# pushed .beads/issues.jsonl that drops or rolls back an issue; it reads git's ref lines from stdin. Seeded by devtools'
+# scripts/install-git-hooks.py: add this repository's own checks after it, with stdin saved first if they need it.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+scripts/git-hooks/beads-regression-check push "$1" || exit 1

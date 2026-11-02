@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# beads-stub: a beads repository's hooks, one file (devtools docs/beads-workflow-review.md D16). Each beads script
+# name in the repository's scripts/git-hooks (post-checkout, post-merge, post-rewrite, beads-precommit, beads-import,
+# beads-rebuild, beads-seed-own, beads-regression-check) and the merge driver .beads/merge-dedup-jsonl.sh are links to
+# it; it runs devtools' scripts/git-hooks/<the name it was run by> (the driver's is beads-merge-jsonl), so every repo
+# runs one implementation. devtools is $FBG_DEVTOOLS_ROOT, else the checkout beside this repository's primary
+# checkout. devtools' scripts/install-git-hooks.py seeds this file and the links; change devtools' copy, not this one.
+name=${0##*/}
+[[ $name == merge-dedup-jsonl.sh ]] && name=beads-merge-jsonl
+if [[ -n ${FBG_DEVTOOLS_ROOT-} ]]; then
+    devtools=$FBG_DEVTOOLS_ROOT
+elif common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+    devtools=$(dirname -- "$(dirname -- "$common")")/devtools
+else
+    echo "$name: not in a git repository, so there is no devtools beside it; set FBG_DEVTOOLS_ROOT" >&2
+    exit 2
+fi
+script=$devtools/scripts/git-hooks/$name
+if [[ ! -x $script ]]; then
+    if [[ -d $devtools/.git || -f $devtools/.git ]]; then
+        echo "$name: $devtools has no scripts/git-hooks/$name; update it: git -C $devtools pull --ff-only" >&2
+    else
+        echo "$name: no devtools checkout at $devtools; clone devtools there or set FBG_DEVTOOLS_ROOT" >&2
+    fi
+elif grep -q '^# beads-stub:' "$script"; then
+    echo "$name: $script is a beads stub too; set FBG_DEVTOOLS_ROOT to a devtools checkout" >&2
+else
+    exec "$script" "$@"
+fi
+# A post-* hook runs after the operation, which a failure would not undo: report only. A commit, push or merge stops.
+[[ $name == post-* ]] && exit 0
+exit 2

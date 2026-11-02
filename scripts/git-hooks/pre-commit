@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# pre-commit: devtools' beads step (scripts/git-hooks/beads-precommit, a link to beads-stub). It reconciles this tree's
+# beads DB with .beads/issues.jsonl, flushes and stages the export, and refuses one that drops or rolls back an issue
+# HEAD has; HACK=1 does not skip it. Seeded by devtools' scripts/install-git-hooks.py: add this repository's own checks
+# after it.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+scripts/git-hooks/beads-precommit || exit 1
