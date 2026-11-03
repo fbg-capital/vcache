@@ -115,7 +115,7 @@ daemon cannot use does not cost every job a fork and an exec.
 
 **Wrong cache.** A connection opens with a handshake that carries the
 protocol version and every setting that decides *where entries live*:
-- disk directory and size
+- disk directory and size (a store's `vcache-store.toml` gives every client one size; `docs/configuration.md`)
 - read-only
 - S3 bucket, region, prefix, endpoint, path style and TTL
 - a digest of the S3 access key id

@@ -7529,6 +7529,68 @@ void TestJobserver() {
   ::unsetenv("VCACHE_DAEMON_JOBSERVER_JOBS");
 }
 
+void TestStoreOwnedDiskSize() {
+  Section("core::LoadConfig store-owned disk size");
+
+  TempCacheDir store;
+  const std::string store_file = store.path() + "/" + core::kStoreConfigFileName;
+  ::setenv("VCACHE_DIR", store.path().c_str(), 1);
+  ::setenv("VCACHE_CACHE_SIZE", "40G", 1);
+  ::setenv("VCACHE_CONFIG", "/nonexistent/vcache.toml", 1);
+  const auto has_warning = [](const core::Config& config, const std::string& text) {
+    for (const std::string& warning : config.warnings) {
+      if (warning.find(text) != std::string::npos) return true;
+    }
+    return false;
+  };
+
+  const core::Config without_file = core::LoadConfig();
+  Check(without_file.disk.max_size == (uint64_t{40} << 30), "without a store file the environment sets the size");
+  Check(without_file.disk.max_size_store_file.empty(), "and no store file is named");
+
+  util::WriteFileAtomic(store_file, "[cache.disk]\nsize = \"100G\"\n");
+  const core::Config with_file = core::LoadConfig();
+  Check(with_file.disk.max_size == (uint64_t{100} << 30), "the store file's size wins over VCACHE_CACHE_SIZE");
+  CheckEq(with_file.disk.max_size_store_file, store_file, "the store file is named as the size's source");
+  Check(core::DescribeConfig(with_file).find("bytes (from " + store_file + ")") != std::string::npos,
+        "--show-config says where the size came from");
+
+  TempCacheDir user_config_dir;
+  const std::string user_config = user_config_dir.path() + "/config.toml";
+  util::WriteFileAtomic(user_config, "[cache.disk]\nsize = \"5G\"\n");
+  ::setenv("VCACHE_CONFIG", user_config.c_str(), 1);
+  ::unsetenv("VCACHE_CACHE_SIZE");
+  Check(core::LoadConfig().disk.max_size == (uint64_t{100} << 30), "the store file's size wins over the config file");
+  ::setenv("VCACHE_CONFIG", "/nonexistent/vcache.toml", 1);
+  ::setenv("VCACHE_CACHE_SIZE", "40G", 1);
+
+  util::WriteFileAtomic(store_file, "[cache.disk]\nsize = 1073741824\n");
+  Check(core::LoadConfig().disk.max_size == (uint64_t{1} << 30), "an integer store size is bytes");
+
+  util::WriteFileAtomic(store_file,
+                        "[cache.disk]\nsize = \"60G\"\ndir = \"/elsewhere\"\n[cache.s3]\nbucket = \"other\"\n");
+  const core::Config extra_keys = core::LoadConfig();
+  Check(extra_keys.disk.max_size == (uint64_t{60} << 30), "the size applies beside other keys");
+  CheckEq(extra_keys.disk.dir, store.path(), "a store file cannot move the store");
+  Check(!extra_keys.s3.enabled, "a store file cannot turn on S3");
+  Check(has_warning(extra_keys, "only cache.disk.size is read"), "other store keys are reported as ignored");
+
+  util::WriteFileAtomic(store_file, "[cache.disk]\nsize = \"lots\"\n");
+  const core::Config unparseable = core::LoadConfig();
+  Check(unparseable.disk.max_size == (uint64_t{40} << 30), "an unparseable store size keeps the client's size");
+  Check(unparseable.disk.max_size_store_file.empty() && has_warning(unparseable, "unparseable size 'lots'"),
+        "and warns");
+
+  util::WriteFileAtomic(store_file, "[cache.disk\n");
+  const core::Config malformed = core::LoadConfig();
+  Check(malformed.disk.max_size == (uint64_t{40} << 30), "a malformed store file keeps the client's size");
+  Check(has_warning(malformed, "store config parse error"), "and warns");
+
+  ::unsetenv("VCACHE_DIR");
+  ::unsetenv("VCACHE_CACHE_SIZE");
+  ::unsetenv("VCACHE_CONFIG");
+}
+
 void TestElasticJobserver() {
   Section("daemon::elastic jobserver");
   struct PolicyCase {
@@ -7908,6 +7970,7 @@ int main(int argc, char** argv) {
   TestUploadGeneration();
   TestHeldHitLayer();
   TestJobserver();
+  TestStoreOwnedDiskSize();
   TestElasticJobserver();
 #if defined(__linux__)
   // Both sample a compiler's process tree through /proc.

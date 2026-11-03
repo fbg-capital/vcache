@@ -38,6 +38,26 @@ refuses command lines that already carry prefix-map flags.
 `vcache --show-config` prints the result of resolving all four layers, which is
 the fastest way to find out why a setting is not taking effect.
 
+### A store that owns its size
+
+A disk store can carry its own size in `<cache.disk.dir>/vcache-store.toml`:
+
+```toml
+[cache.disk]
+size = "100G"
+```
+
+When the file is there, its `cache.disk.size` wins over the config file and
+`VCACHE_CACHE_SIZE`, for every client of that store: builds, the daemon and
+`--trim`. Every vcache disk write trims the store to the size its client was
+given, so one client still asking for less would shrink a shared store, and a
+daemon refuses a client whose size differs from its own. Keeping the size in
+the store gives them all one answer, and it goes when the store goes. The file
+sets only the size; any other key in it is ignored with a warning, because a
+store must not move itself or turn on another layer. A file that does not parse
+keeps the client's size and warns. `--show-config` names the file after the
+size it set.
+
 ## The config file
 
 Searched in this order; the first that exists is used, and only that one:
@@ -103,7 +123,7 @@ timeout        = 30                # seconds
 | `vcache.rust_path_env_vars` | `VCACHE_RUST_PATH_ENV_VARS` | — | none |
 | `cache.disk.enabled` | `VCACHE_DISK` | — | `true` |
 | `cache.disk.dir` | `VCACHE_DIR` | — | `$XDG_CACHE_HOME/vcache`, else `~/.cache/vcache` |
-| `cache.disk.size` | `VCACHE_CACHE_SIZE` | — | `10G` |
+| `cache.disk.size` | `VCACHE_CACHE_SIZE` | — | `10G`; a store's `vcache-store.toml` wins over both |
 | `cache.s3.enabled` | — | — | `false` |
 | `cache.s3.bucket` | `VCACHE_S3_BUCKET` | — | none |
 | `cache.s3.region` | `VCACHE_S3_REGION`, `AWS_REGION`, `AWS_DEFAULT_REGION` | — | `us-east-1` |
