@@ -473,6 +473,24 @@ The checksum is not paranoia: a silently corrupt object linked into a binary is
 far worse than a cache miss, and object storage plus local disk gives two
 independent opportunities for truncation.
 
+**Manifests across layers.** A plain lookup stops at the first layer that has
+the key: an entry is the same everywhere. A manifest is not. Each layer's copy
+holds the states recorded where it was written, and a faster copy can be
+entirely stale while a slower one holds the state this tree needs. CI runners
+start from a disk cache baked from an older tree next to a shared S3. So the
+dependency-scan, C/C++, Rust and link lookups take the next layer's copy
+(`CacheChain::GetAfter`) once no state of the copies seen so far holds.
+
+- A match there is promoted into the faster layers (`PutBefore`), merged with a
+  fresh re-read of them, so the next lookup stops at the first.
+- A store merges every copy the lookup saw, so it does not overwrite S3's
+  states with the disk's.
+- A lookup answered by the first copy costs nothing extra. A real miss behind
+  a faster copy costs one more manifest read.
+- The merge keeps the newest `kMaxManifestStates` (eight). A store ranks the
+  faster copy's states ahead of a slower copy's, so a faster copy already full
+  of stale states can still push S3's out.
+
 **Sidecar files.** Some outputs are too large to carry inside an entry. A link
 output, and a Rust output of 4 MiB or more other than its `.d`, is kept in the
 disk cache as a content-addressed file of its own, `<dir>/<digest[0:2]>/<digest>.<suffix>`
@@ -542,6 +560,17 @@ because `relatime` mounts do not reliably update `atime`.
 AWS SDK keeps the dependency footprint small; the signing code is ~60 lines and
 is covered by known-answer tests. `403` is treated the same as `404`, since
 buckets without `ListBucket` permission return it for a missing key.
+
+An object's age is its `Last-Modified`, which a read never moves, so expiry by
+age alone would retire entries that are in constant use, and retire a whole
+warm-up's worth of them on one day. A hit on an entry at least `refresh_days`
+old (half the TTL by default) therefore copies the object onto itself
+(`CopyObject`, `x-amz-metadata-directive: REPLACE`), a server-side write that
+resets `Last-Modified` and a lifecycle rule's clock without re-uploading. The
+copy carries two `x-amz-*` headers, and S3 refuses unsigned ones, so the signer
+takes extra headers and merges them into its sorted canonical set. It runs
+after the TTL check, so an expired entry is never revived, and its failure is
+logged but does not touch the hit.
 
 **Chain.** First hit wins; the hit is written back into every faster layer it
 passed through. Any backend error is reported as a miss.

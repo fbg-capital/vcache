@@ -1581,6 +1581,40 @@ class FakeStorage : public storage::Storage {
 void TestCacheChain() {
   Section("storage::CacheChain");
 
+  // GetAfter continues a lookup past the layer that answered it, which is how a
+  // manifest lookup reaches a slower layer's copy when the faster one is stale.
+  // PutBefore promotes into the faster layers only.
+  {
+    auto disk = std::make_unique<FakeStorage>("disk");
+    auto s3 = std::make_unique<FakeStorage>("s3");
+    FakeStorage* disk_ptr = disk.get();
+    FakeStorage* s3_ptr = s3.get();
+    disk_ptr->Seed("abcdef", "stale");
+    s3_ptr->Seed("abcdef", "fresh");
+
+    storage::CacheChain chain;
+    chain.AddLayer(std::move(disk));
+    chain.AddLayer(std::move(s3));
+
+    const storage::GetResult first = chain.Get("abcdef");
+    CheckEq(first.value, "stale", "Get stops at the fastest copy");
+    const storage::GetResult next = chain.GetAfter("abcdef", first.layer);
+    Check(next.hit && next.layer == "s3", "GetAfter answers from the next layer");
+    CheckEq(next.value, "fresh", "and with that layer's copy");
+    Check(!chain.GetAfter("abcdef", "s3").hit, "nothing is slower than the last layer");
+    Check(!chain.GetAfter("abcdef", "nonesuch").hit, "an unknown layer answers nothing");
+
+    const int s3_puts = s3_ptr->puts;
+    Check(chain.PutBefore("abcdef", "merged", "s3").stored,
+          "PutBefore stores into the faster layer");
+    std::string value;
+    disk_ptr->Get("abcdef", &value);
+    CheckEq(value, "merged", "the faster layer now holds the merged copy");
+    Check(s3_ptr->puts == s3_puts, "PutBefore leaves the layer it names alone");
+    Check(!chain.PutBefore("abcdef", "x", "disk").stored,
+          "nothing is faster than the first layer");
+  }
+
   // A store must reach every writable layer. This is what makes a compile on
   // one machine visible to every other one: there is no later promotion step
   // that would move a local-only entry up to the shared layer.
@@ -1751,6 +1785,10 @@ class FakeRemote : public storage::RemoteCache {
     entries_[key] = value;
     result->stored = true;
     return true;
+  }
+  bool GetAfter(const std::string& /*key*/, const std::string& /*after*/,
+                storage::GetResult* /*result*/) override {
+    return !*broken_;  // one layer: nothing after it
   }
 
  private:
@@ -2201,8 +2239,9 @@ void TestCompileSessions() {
   Check(fd >= 0 && refused.U8(&status) &&
             status == static_cast<uint8_t>(daemon::Status::kRefused) &&
             refused.Str(&reason) && reason.find("version 1") != std::string::npos &&
-            reason.find("speaks 2") != std::string::npos,
-        "v1 hello is refused and names client version 1 and daemon version 2");
+            reason.find("speaks " + std::to_string(daemon::kProtocolVersion)) !=
+                std::string::npos,
+        "v1 hello is refused and names client version 1 and the daemon's version");
   if (fd >= 0) ::close(fd);
 
   fd = server.Open(&reply);
@@ -4715,6 +4754,38 @@ void TestSigV4() {
       "GET", "/bkt", "list-type=2", "h", "20150830T123600Z", "20150830",
       Sha256Hex(""), "", "us-east-1", "AKIDEXAMPLE", secret);
   Check(unqueried != queried, "the query string is covered by the signature");
+
+  // A refresh is a copy of the object onto itself. S3 refuses x-amz-* headers
+  // it was not asked to sign, so both copy headers must join SignedHeaders in
+  // sorted order. Reference signatures from botocore's S3SigV4Auth, which also
+  // reproduces the PUT signature above.
+  const std::vector<Header> copy_headers = {
+      {"x-amz-metadata-directive", "REPLACE"},  // deliberately out of order
+      {"x-amz-copy-source", "/bkt/vcache/ab/cdef"},
+  };
+  const std::string copy = BuildAuthorization(
+      "PUT", "/vcache/ab/cdef", /*query=*/"", "bkt.s3.us-east-1.amazonaws.com",
+      "20150830T123600Z", "20150830", Sha256Hex(""), /*session_token=*/"",
+      "us-east-1", "AKIDEXAMPLE", secret, copy_headers);
+  Check(copy.find("SignedHeaders=host;x-amz-content-sha256;x-amz-copy-source;"
+                  "x-amz-date;x-amz-metadata-directive,") != std::string::npos,
+        "copy headers are signed, in sorted order");
+  Check(copy.find("Signature=e9c8eefdbdc170aeb33373c91556c32e9d6408f9b076fbf0603e061c56f9a10c") !=
+            std::string::npos,
+        "copy request signature matches botocore");
+  const std::string copy_token = BuildAuthorization(
+      "PUT", "/vcache/ab/cdef", /*query=*/"", "bkt.s3.us-east-1.amazonaws.com",
+      "20150830T123600Z", "20150830", Sha256Hex(""), "TOKEN", "us-east-1",
+      "AKIDEXAMPLE", secret, copy_headers);
+  Check(copy_token.find("x-amz-metadata-directive;x-amz-security-token,") != std::string::npos,
+        "a session token sorts after the copy headers");
+  Check(copy_token.find("Signature=b0384734487faffabddd833ca5b931d609cbb04988215f46a4f7d75185747c33") !=
+            std::string::npos,
+        "copy request signature with a session token matches botocore");
+  CheckEq(BuildAuthorization("PUT", "/vcache/ab/cdef", "", "bkt.s3.us-east-1.amazonaws.com",
+                             "20150830T123600Z", "20150830", payload_hash, "",
+                             "us-east-1", "AKIDEXAMPLE", secret, {}),
+          auth, "no extra headers signs exactly as before");
 }
 
 void TestS3ResponseParsing() {

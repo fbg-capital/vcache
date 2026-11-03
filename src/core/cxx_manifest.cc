@@ -71,10 +71,8 @@ std::string CanonicalizeArg(const std::string& arg, const RootMap& roots) {
 std::vector<CxxManifestState> MergeCxxManifestStates(CxxManifestState fresh,
                                                      std::vector<CxxManifestState> reread,
                                                      const std::vector<CxxManifestState>& loaded) {
-  const auto recorded_inputs = [](const CxxManifestState& state) {
-    return std::tie(state.files, state.absent);
-  };
-  return MergeManifestStates(std::move(fresh), std::move(reread), loaded, recorded_inputs);
+  return MergeManifestStates(std::move(fresh), std::move(reread), loaded,
+                             CxxManifestRecordedInputs);
 }
 
 // A header line, then per state a "state <result key>" line followed by one
