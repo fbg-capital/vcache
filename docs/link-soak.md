@@ -238,6 +238,12 @@ The nightly el10 builds, started 2026-10-23, supplied most of el10's count.
 The decision and the counters are in `reset-deployment.log` and on vcache-trk.3.
 Both timers were disabled with `host-setup-buildcache.sh --link-soak off`.
 
+The soak ran binaries up to 1.13, where verification stopped at the first
+holding entry whose outputs or depfile were not on disk and counted the link as
+an ordinary miss. From the upstream 2.0.2 merge, it moves on to the next holding
+entry, so a later soak can verify links this one did not; its counts are not
+directly comparable with the table above.
+
 The same evening, a controlled ordinary-hit comparison on sunbird 8f9e01b: four
 clean builds per platform (`off`, `off`, `on`, `on`), host and el10. Sunbird's
 post-link `buildinfo patch` rewrites `.note.buildinfo` and `.note.buildsig` in

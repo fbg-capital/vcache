@@ -31,6 +31,8 @@ cat > "$WORK/gcc" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 if [[ ${1:-} != main.o ]]; then exec "$REAL_CC" "$@"; fi
+# A traced absence outside the key gives one command two manifest entries.
+if [[ -n ${LINK_VERIFY_PROBE:-} ]]; then [[ -e $LINK_VERIFY_PROBE ]] || :; fi
 if [[ ${LINK_VERIFY_EXPECT_OUTPUT:-0} == 1 ]]; then
   grep -qx caller-owned app || { echo 'cached output was placed before linking' >&2; exit 38; }
 fi
@@ -164,6 +166,31 @@ fill main
 run_link disabled base VCACHE_LINK_CACHE=0 VCACHE_LINK_VERIFY=1
 check 'verify with link caching off runs normally' "$?" 0
 check 'verify with link caching off does not compare' "$(stat_of 'link mismatch')/$(stat_of 'link verified')" 0/0
+
+# Two entries both hold; the newer one's map is no longer on disk. Nothing of it
+# is placed, so the lookup must go on to the older entry in both modes.
+new_store
+run_link multi-old base LINK_VERIFY_PROBE="$WORK/absent-old"
+run_link multi-new map LINK_VERIFY_PROBE="$WORK/absent-new" VCACHE_RECACHE=1
+check 'two holding entries are stored' "$(stat_of 'entries stored')" 2
+for sidecar in "$VCACHE_DIR"/??/*.linkout; do
+  if cmp -s "$sidecar" "$WORK/a/app.map"; then mv "$sidecar" "$sidecar.saved"; fi
+done
+"$VCACHE" --zero-stats >/dev/null
+# A miss here would store a third entry, so verification gets its own copy.
+two_entries=$VCACHE_DIR
+cp -R "$two_entries" "$two_entries-verify"
+run_link multi-hit base
+check 'an unusable newer entry falls through to an older hit' "$(stat_of 'cache hit (disk)')" 1
+check 'the fall-through is not a miss' "$(stat_of 'cache miss')" 0
+check 'the newer entry was found unusable' \
+  "$(grep -c 'link hit: stored output is gone' "$WORK/multi-hit.log")" 1
+check 'the older entry serves its own binary' "$(cmp -s "$WORK/a/app" "$WORK/expected-app" && echo yes)" yes
+check 'the older entry serves its own map' "$(cmp -s "$WORK/a/app.map" "$WORK/expected-map" && echo yes)" yes
+export VCACHE_DIR=$two_entries-verify
+run_link multi-verify base VCACHE_LINK_VERIFY=1
+check 'verification compares against the older usable entry' "$(stat_of 'link verified')" 1
+check 'and finds no mismatch there' "$(stat_of 'link mismatch')/$(stat_of 'link verify error')" 0/0
 
 for warmth in cold warm; do
   new_store
