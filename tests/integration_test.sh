@@ -2488,6 +2488,21 @@ check "--stop-daemon stops it" "$("$VCACHE" --stop-daemon | grep -c 'stopped')" 
 check "and nothing answers afterwards" \
   "$("$VCACHE" --daemon-status >/dev/null 2>&1; echo $?)" "1"
 
+# A store that owns its size gives every client the same one, so a client and a daemon whose VCACHE_CACHE_SIZE
+# differ still meet.
+reset_cache
+mkdir -p "$VCACHE_DIR"
+printf '[cache.disk]\nsize = "3G"\n' > "$VCACHE_DIR/vcache-store.toml"
+check "--show-config names the store file as the size's source" \
+  "$(VCACHE_CACHE_SIZE=5G "$VCACHE" --show-config | grep -c "3221225472 bytes (from $VCACHE_DIR/vcache-store.toml)")" "1"
+VCACHE_CACHE_SIZE=7G "$VCACHE" --start-daemon >/dev/null
+VCACHE_CACHE_SIZE=5G compile_a "$WORK/d3s.o"
+check "a client with another VCACHE_CACHE_SIZE is not refused by the store's daemon" \
+  "$("$VCACHE" --daemon-status | grep -c ' 0 refused')" "1"
+check "and its compile went through the daemon" "$(daemon_stat 'stores')" "1"
+"$VCACHE" --stop-daemon >/dev/null
+rm -f "$VCACHE_DIR/vcache-store.toml"
+
 # auto: the first compile starts the daemon. It must not keep the build's
 # output pipe open, or `$(...)` -- and make, and a CI step -- never finishes.
 export VCACHE_DAEMON=auto

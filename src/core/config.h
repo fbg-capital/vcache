@@ -20,10 +20,16 @@
 
 namespace vcache::core {
 
+// The file inside a disk store that owns the store's size: every client of the store reads one size from it,
+// whatever its own environment or config file says, so no client trims the store to a smaller one.
+inline constexpr const char* kStoreConfigFileName = "vcache-store.toml";
+
 struct DiskCacheConfig {
   bool enabled = true;
   std::string dir;              // default ~/.cache/vcache
   uint64_t max_size = 10ull << 30;  // 10 GiB
+  // The store's kStoreConfigFileName when it set max_size; empty otherwise.
+  std::string max_size_store_file;
 };
 
 struct S3CacheConfig {

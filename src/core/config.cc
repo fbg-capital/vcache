@@ -535,6 +535,63 @@ const char* DaemonModeName(DaemonMode mode) {
   return "off";
 }
 
+// The store's own file sets only its size. Anything else in it is ignored with a warning: where entries live and how
+// they are found stay the client's settings, and a store must not redirect them.
+void ApplyStoreFile(Config* config) {
+  const std::string path = config->disk.dir + "/" + kStoreConfigFileName;
+  if (!util::FileExists(path)) return;
+  auto text = util::ReadFile(path);
+  if (!text) {
+    config->warnings.push_back("could not read store config " + path);
+    return;
+  }
+  toml::parse_result parsed = toml::parse(*text, path);
+  if (!parsed) {
+    std::ostringstream oss;
+    oss << "store config parse error at " << path << ":"
+        << parsed.error().source().begin.line << ": " << parsed.error().description();
+    config->warnings.push_back(oss.str());
+    return;
+  }
+  const toml::table& root = parsed.table();
+  bool has_other_key = false;
+  for (const auto& [section, node] : root) {
+    const toml::table* cache = node.as_table();
+    if (section != "cache" || cache == nullptr) {
+      has_other_key = true;
+      continue;
+    }
+    for (const auto& [name, child] : *cache) {
+      const toml::table* disk = child.as_table();
+      if (name != "disk" || disk == nullptr) {
+        has_other_key = true;
+        continue;
+      }
+      for (const auto& [key, value] : *disk) {
+        if (key != "size") has_other_key = true;
+      }
+    }
+  }
+  if (has_other_key) {
+    config->warnings.push_back("store config " + path + ": only cache.disk.size is read; other keys ignored");
+  }
+  const toml::table* disk = root["cache"]["disk"].as_table();
+  if (disk == nullptr) return;
+  uint64_t bytes = 0;
+  if (auto v = TomlString(*disk, "size")) {
+    if (!util::ParseSize(*v, &bytes)) {
+      config->warnings.push_back("store config " + path + ": unparseable size '" + *v + "'");
+      return;
+    }
+  } else if (auto n = TomlInt(*disk, "size"); n && *n > 0) {
+    bytes = static_cast<uint64_t>(*n);
+  } else {
+    return;
+  }
+  config->disk.max_size = bytes;
+  config->disk.max_size_store_file = path;
+}
+
 Config LoadConfig() {
   Config config;
   config.disk.dir = DefaultDiskDir();
@@ -544,6 +601,7 @@ Config LoadConfig() {
   ApplyEnvironment(&config);
 
   if (config.disk.dir.empty()) config.disk.dir = DefaultDiskDir();
+  ApplyStoreFile(&config);
   if (config.s3.enabled && config.s3.bucket.empty()) {
     config.warnings.push_back("s3 cache enabled but no bucket configured; disabling");
     config.s3.enabled = false;
@@ -562,7 +620,9 @@ std::string DescribeConfig(const Config& config) {
   out << "config file:      " << (config.loaded_from.empty() ? "(none)" : config.loaded_from) << "\n";
   out << "disk cache:       " << (config.disk.enabled ? "enabled" : "disabled") << "\n";
   out << "  dir:            " << config.disk.dir << "\n";
-  out << "  max size:       " << config.disk.max_size << " bytes\n";
+  out << "  max size:       " << config.disk.max_size << " bytes";
+  if (!config.disk.max_size_store_file.empty()) out << " (from " << config.disk.max_size_store_file << ")";
+  out << "\n";
   out << "s3 cache:         " << (config.s3.enabled ? "enabled" : "disabled") << "\n";
   if (config.s3.enabled) {
     out << "  bucket:         " << config.s3.bucket << "\n";
