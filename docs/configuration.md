@@ -303,7 +303,9 @@ hits against a fresh link. The equivalent TOML keys are `vcache.link_cache` and
 `--show-config` reports verification as ignored when link caching is off.
 
 Verification validates the cached output set and sidecar checksums, then runs
-the real linker under the tracer. It compares every declared output, including
+the real linker under the tracer. An entry whose outputs or depfile are not on
+this disk is passed over for the next entry that still holds, as an ordinary
+lookup does. It compares every declared output, including
 map files, by content digest and recorded executable status. Dependency files
 compare the localized replay rules against the fresh rules, preserving path
 spellings and order while ignoring line wrapping. Canonicalizing both sides
