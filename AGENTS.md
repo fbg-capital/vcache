@@ -188,7 +188,7 @@ make kernel-test                       # Linux kernel recipe, by hand only
 make clean / make distclean            # distclean also drops the fetched third-party trees
 ```
 
-Baseline on `fbg` after the 1.3.0 merge: **499 unit / 379 integration checks, 0 failed**.
+Baseline on `fbg` after the 2.0.2 merge and the store-owned size: **1606 unit / 1410 integration checks, 0 failed**.
 Any PR must keep both at zero failures.
 
 - Unit tests: one `Section("...")` per area, `Check(cond, "what")` / `CheckEq(actual,
