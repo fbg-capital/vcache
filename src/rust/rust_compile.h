@@ -24,6 +24,7 @@
 #include <string_view>
 #include <vector>
 
+#include "args/rustc_args.h"
 #include "core/config.h"
 #include "core/roots.h"
 #include "storage/chain.h"
@@ -34,6 +35,17 @@ namespace vcache::rust {
 // enters a cache key is only the banner, so two machines still share entries.
 std::string ResolveRustcFingerprint(const std::string& rustc,
                                     const std::string& cache_dir);
+
+// What the key of a crate that rustc links holds about the linker, as a digest:
+// the program -C linker names (rustc's default, cc, without one), found on
+// PATH as rustc finds it, by canonical real path and content; and the content
+// of every gcc specs file it is told to read, through -C link-arg(s) or, when
+// the program is a script such as musl-gcc, through a -specs word in the
+// script itself. What the driver finds on its own (ld, crt files, built-in
+// specs, the compiler a script runs) is not covered. Hashes are memoised by
+// file identity under `cache_dir`.
+std::string ResolveLinkerIdentity(const args::RustcArgs& parsed, const core::RootMap& roots,
+                                  const std::string& cache_dir);
 
 // False when a stored output name could write outside the output directory:
 // empty, a NUL, absolute, or any `..` component. A `.` component is allowed.

@@ -750,7 +750,8 @@ EOF
 
   # A binary crate: cargo runs build scripts and binaries straight out of the
   # output directory, so the execute bit has to survive both the miss (where
-  # vcache places the artifacts itself) and the hit.
+  # vcache places the artifacts itself) and the hit. Only with the link cache
+  # on is a binary crate cached at all (9k).
   mkdir -p "$WORK/rust-bin-a/src" "$WORK/rust-bin-b/src"
   for tree in rust-bin-a rust-bin-b; do
     cat > "$WORK/$tree/src/main.rs" <<'EOF'
@@ -758,13 +759,13 @@ fn main() { println!("built at {}", file!()); }
 EOF
   done
 
-  ( cd "$WORK/rust-bin-a" && VCACHE_ROOTS="$WORK/rust-bin-a=bin" \
+  ( cd "$WORK/rust-bin-a" && VCACHE_ROOTS="$WORK/rust-bin-a=bin" VCACHE_LINK_CACHE=1 \
       "$VCACHE" rustc --crate-name demobin --crate-type bin \
       --emit=dep-info,link --out-dir "$WORK/rust-bin-a/out" src/main.rs ) 2>/dev/null
   check "a fresh binary crate is executable" \
     "$([[ -x "$WORK/rust-bin-a/out/demobin" ]] && echo yes)" "yes"
 
-  ( cd "$WORK/rust-bin-b" && VCACHE_ROOTS="$WORK/rust-bin-b=bin" \
+  ( cd "$WORK/rust-bin-b" && VCACHE_ROOTS="$WORK/rust-bin-b=bin" VCACHE_LINK_CACHE=1 \
       "$VCACHE" rustc --crate-name demobin --crate-type bin \
       --emit=dep-info,link --out-dir "$WORK/rust-bin-b/out" src/main.rs ) 2>/dev/null
   check "a restored binary crate is executable" \
@@ -873,7 +874,7 @@ else
   for tree in place-umask-a place-umask-b; do
     mkdir -p "$WORK/$tree/src"
     echo 'fn main() {}' > "$WORK/$tree/src/main.rs"
-    ( umask 077 && cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=bin" \
+    ( umask 077 && cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=bin" VCACHE_LINK_CACHE=1 \
         "$VCACHE" rustc --crate-name umaskbin --crate-type bin \
         --emit=dep-info,link --out-dir "$WORK/$tree/out" src/main.rs ) >/dev/null 2>&1
   done
@@ -1078,7 +1079,7 @@ XDEVEOF
   echo 'fn main() {}' > "$WORK/rename-xdev-bin/src/main.rs"
   ( umask 077 && cd "$WORK/rename-xdev-bin" && VCACHE_ROOTS="$WORK/rename-xdev-bin=bin" \
       VCACHE_DAEMON=off XDEV_INTO="$WORK/rename-xdev-bin/out" LD_PRELOAD="$WORK/rename-xdev.so" \
-      "$VCACHE" rustc --crate-name xdevbin --crate-type bin \
+      VCACHE_LINK_CACHE=1 "$VCACHE" rustc --crate-name xdevbin --crate-type bin \
       --emit=dep-info,link --out-dir "$WORK/rename-xdev-bin/out" src/main.rs ) >/dev/null 2>&1
   check "a binary copied after EXDEV under umask 077 is placed, not passed through" \
     "$(misses) $(unplaceable)" "1 0"
@@ -1287,7 +1288,7 @@ SECONDEOF
       'fn main() { std::process::exit(i32::from(BIG[std::env::args().count()]) - 7); }' \
       > "$WORK/$tree/src/main.rs"
     ( umask 077 && cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=bin" VCACHE_DAEMON=off \
-        "$VCACHE" rustc --crate-name sidebin --crate-type bin \
+        VCACHE_LINK_CACHE=1 "$VCACHE" rustc --crate-name sidebin --crate-type bin \
         --emit=dep-info,link --out-dir "$WORK/$tree/out" src/main.rs ) >/dev/null 2>&1
   done
   check "a large binary crate is a sidecar and hits" "$(sidecar_files) $(hits)" "1 1"
@@ -1314,6 +1315,136 @@ SECONDEOF
   else
     skipped "VCACHE_PREVIOUS not set: the older-reader check needs an older vcache binary"
   fi
+fi
+
+# --------------------------------------------------------------------------
+section "9k. Rust: linked crates, the link cache and the linker"
+
+# An executable rustc links is a link: with link caching off it is never
+# served, so a changed linker always takes effect. Every crate rustc links is
+# keyed on the linker, including the specs file a wrapper such as musl-gcc
+# hands gcc. rlibs and proc-macros stay cached either way.
+if ! command -v rustc >/dev/null 2>&1; then
+  skipped "rustc not installed"
+else
+  (
+    FAIL=0
+    export VCACHE_DAEMON=off
+    link_off() { local n; n=$(stat_of "rust link cache off"); echo "${n:-0}"; }
+    rust_link_compile() {  # $1 = tree, $2 = link cache, then rustc arguments
+      local tree=$1 link_cache=$2
+      shift 2
+      mkdir -p "$WORK/$tree/out"
+      ( cd "$WORK/$tree" && VCACHE_ROOTS="$WORK/$tree=crate" VCACHE_LINK_CACHE=$link_cache \
+          VCACHE_LOG="$WORK/$tree.log" "$VCACHE" rustc "$@" --out-dir "$WORK/$tree/out" ) \
+        >/dev/null 2>&1
+    }
+
+    reset_cache
+    for tree in lk-bin-a lk-bin-b; do
+      mkdir -p "$WORK/$tree/src"
+      echo 'fn main() { println!("linked"); }' > "$WORK/$tree/src/main.rs"
+      rust_link_compile "$tree" 0 --crate-name lkbin --crate-type bin \
+        --emit=dep-info,link src/main.rs
+    done
+    check "a bin crate with the link cache off is not served from the cache" \
+      "$(hits) $(misses)" "0 0"
+    check "each run is counted as rust link cache off" "$(link_off)" "2"
+    check "and rustc links it" "$("$WORK/lk-bin-b/out/lkbin" 2>/dev/null)" "linked"
+
+    reset_cache
+    for tree in lk-test-a lk-test-b; do
+      mkdir -p "$WORK/$tree/src"
+      echo '#[test] fn t() {}' > "$WORK/$tree/src/lib.rs"
+      rust_link_compile "$tree" 0 --crate-name lktest --test --emit=dep-info,link src/lib.rs
+    done
+    check "a --test harness with the link cache off is not served" "$(hits) $(link_off)" "0 2"
+    for tree in lk-dflt-a lk-dflt-b; do
+      mkdir -p "$WORK/$tree/src"
+      echo 'fn main() {}' > "$WORK/$tree/src/main.rs"
+      rust_link_compile "$tree" 0 --crate-name lkdflt --emit=dep-info,link src/main.rs
+    done
+    check "nor is a crate with no --crate-type" "$(hits) $(link_off)" "0 4"
+    for tree in lk-check-a lk-check-b; do
+      mkdir -p "$WORK/$tree/src"
+      echo 'fn main() {}' > "$WORK/$tree/src/main.rs"
+      rust_link_compile "$tree" 0 --crate-name lkcheck --crate-type bin \
+        --emit=dep-info,metadata src/main.rs
+    done
+    check "a bin crate checked without --emit=link still hits" "$(hits) $(link_off)" "1 4"
+
+    reset_cache
+    for tree in lk-rlib-a lk-rlib-b; do
+      mkdir -p "$WORK/$tree/src"
+      echo 'pub fn value() -> u32 { 42 }' > "$WORK/$tree/src/lib.rs"
+      rust_link_compile "$tree" 0 --crate-name lkrlib --crate-type lib \
+        --emit=dep-info,metadata,link src/lib.rs
+    done
+    check "an rlib with the link cache off still hits" "$(hits) $(link_off)" "1 0"
+
+    for tree in lk-pm-a lk-pm-b; do
+      mkdir -p "$WORK/$tree/src"
+      printf '%s\n' 'use proc_macro::TokenStream;' \
+        '#[proc_macro] pub fn same(input: TokenStream) -> TokenStream { input }' \
+        > "$WORK/$tree/src/lib.rs"
+      rust_link_compile "$tree" 0 --crate-name lkpm --crate-type proc-macro --edition 2021 \
+        --extern proc_macro --emit=dep-info,link src/lib.rs
+    done
+    check "a proc-macro with the link cache off still hits" "$(hits) $(link_off)" "2 0"
+    check "and its hit is logged as a linked crate served from the cache" \
+      "$(grep -c 'linked crate lkpm served from the cache' "$WORK/lk-pm-b.log")" "1"
+    check "an rlib hit is not" \
+      "$(grep -c 'linked crate' "$WORK/lk-rlib-b.log")" "0"
+
+    # musl-gcc's shape: a script that runs the C compiler with a specs file.
+    # The deploy that met this changed only the specs file, and got the old
+    # binary back.
+    lk_specs="$WORK/lk-linker/musl.specs"
+    mkdir -p "$WORK/lk-linker"
+    printf '*link:\n+ \n\n' > "$lk_specs"
+    printf 'int main(void) { return 0; }\n' > "$WORK/lk-linker/probe.c"
+    if ! cc -specs "$lk_specs" "$WORK/lk-linker/probe.c" -o "$WORK/lk-linker/probe" \
+        >/dev/null 2>&1; then
+      skipped "cc does not take -specs: the specs-file checks need gcc"
+    else
+      {
+        printf '%s\n' '#!/bin/sh'
+        printf 'exec cc "$@" -specs "%s"\n' "$lk_specs"
+      } > "$WORK/lk-linker/musl-gcc"
+      chmod +x "$WORK/lk-linker/musl-gcc"
+      reset_cache
+      mkdir -p "$WORK/lk-specs/src"
+      echo 'fn main() {}' > "$WORK/lk-specs/src/main.rs"
+      lk_specs_compile() {
+        rust_link_compile lk-specs 1 --crate-name lkspecs --crate-type bin \
+          -C "linker=$WORK/lk-linker/musl-gcc" --emit=dep-info,link src/main.rs
+      }
+      lk_specs_compile
+      lk_specs_compile
+      check "with the link cache on, a bin crate linked by a wrapper hits" \
+        "$(hits) $(misses)" "1 1"
+      check "and the hit is logged as a linked crate served from the cache" \
+        "$(grep -c 'linked crate lkspecs served from the cache' "$WORK/lk-specs.log")" "1"
+      printf '*link:\n+ --build-id=sha1\n\n' > "$lk_specs"
+      lk_specs_compile
+      check "a changed specs file the wrapper names is a miss" "$(hits) $(misses)" "1 2"
+      lk_specs_compile
+      check "and the relinked binary is then served" "$(hits) $(misses)" "2 2"
+
+      # --evict deletes one entry by the key the log names.
+      lk_key=$(sed -n 's/.*linked crate lkspecs served from the cache, entry //p' \
+        "$WORK/lk-specs.log" | tail -1)
+      check "--evict deletes the entry the log names" \
+        "$("$VCACHE" --evict "$lk_key" 2>&1)" "evicted $lk_key from $VCACHE_DIR"
+      lk_specs_compile
+      check "the next build of an evicted entry is a miss" "$(hits) $(misses)" "2 3"
+      check "--evict of an absent key says so" \
+        "$("$VCACHE" --evict "${lk_key//?/0}" 2>&1)" "no entry ${lk_key//?/0} in $VCACHE_DIR"
+      "$VCACHE" --evict not-a-key >/dev/null 2>&1
+      check "--evict refuses what is not a key" "$?" "1"
+    fi
+    [[ "$FAIL" == 0 ]]
+  ) && ok "Rust linked crates" || bad "Rust linked crates"
 fi
 
 # --------------------------------------------------------------------------

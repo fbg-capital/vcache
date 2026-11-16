@@ -71,6 +71,7 @@ enum class Reason : uint8_t {
   kExplicitOutput,
   kNoEmit,
   kEmitWithPath,
+  kRustLinkCacheOff,
   // Preprocessing, or rustc's dependency pass, did not succeed.
   kPreprocessorError,
   kNoRustDepInfo,
@@ -128,6 +129,7 @@ inline constexpr ReasonInfo kReasons[] = {
     {Reason::kExplicitOutput, Outcome::kUncacheable, "explicit -o"},
     {Reason::kNoEmit, Outcome::kUncacheable, "no --emit"},
     {Reason::kEmitWithPath, Outcome::kUncacheable, "--emit with path"},
+    {Reason::kRustLinkCacheOff, Outcome::kUncacheable, "rust link cache off"},
     {Reason::kPreprocessorError, Outcome::kPreprocessFailed, "preprocessor error"},
     {Reason::kNoRustDepInfo, Outcome::kPreprocessFailed, "no rust dep-info"},
     {Reason::kNoTempDir, Outcome::kPassthrough, "no temp dir"},

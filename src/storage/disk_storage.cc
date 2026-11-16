@@ -212,6 +212,16 @@ std::optional<std::string> DiskStorage::GetFile(const std::string& digest,
   return path;
 }
 
+DiskStorage::RemoveEntryStatus DiskStorage::RemoveEntry(const std::string& key) {
+  ClearError();
+  if (!IsHexDigest(key)) return RemoveEntryStatus::kNotADigest;
+  const std::string path = PathForKey(key);
+  if (util::RemoveFile(path)) return RemoveEntryStatus::kRemoved;
+  if (errno == ENOENT) return RemoveEntryStatus::kAbsent;
+  SetError("remove " + path + ": " + std::strerror(errno));
+  return RemoveEntryStatus::kFailed;
+}
+
 void DiskStorage::RemoveFile(const std::string& digest, const std::string& suffix) {
   if (read_only_ || !IsHexDigest(digest)) return;
   util::RemoveFile(PathForFile(digest, suffix));

@@ -35,6 +35,16 @@ struct RustcArgs {
   std::vector<std::string> emit_kinds;  // parsed from --emit
   std::vector<ExternCrate> externs;
 
+  // Every --crate-type value, comma lists split. Empty means rustc's default,
+  // which is bin unless the crate root says otherwise.
+  std::vector<std::string> crate_types;
+  bool test_harness = false;  // --test
+
+  // The last -C linker= value, as given; empty when rustc picks its default.
+  std::string linker;
+  // The -C link-arg values and the words of every -C link-args, in order.
+  std::vector<std::string> linker_args;
+
   // Flags that belong in the cache key. Search paths, the output directory and
   // the -C incremental directory are excluded: they change between checkouts
   // without changing the result, and the --extern contents already pin what
@@ -53,6 +63,13 @@ struct RustcArgs {
 
   std::optional<core::Decision> uncacheable;
   bool cacheable() const { return !uncacheable.has_value(); }
+
+  // True when rustc runs the linker: --emit includes link and the crate is an
+  // executable (bin, the default, or a --test harness), a dylib, a cdylib or a
+  // proc-macro.
+  bool runs_linker() const;
+  // True when the linked output is an executable: bin, the default, or --test.
+  bool links_executable() const;
 };
 
 RustcArgs ParseRustc(const std::vector<std::string>& argv);

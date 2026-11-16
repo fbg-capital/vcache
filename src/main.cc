@@ -77,6 +77,8 @@ void PrintUsage() {
       "                        opposed to merely cold); off by default\n"
       "      --trim            evict entries until the cache is under its limit\n"
       "                        (disk; also expires and caps s3 when configured)\n"
+      "      --evict KEY       delete the disk entry KEY, as VCACHE_LOG names it\n"
+      "                        (\"rust key\", \"entry\"); s3 is not touched\n"
       "\n"
       "Daemon (see docs/daemon.md):\n"
       "      --start-daemon    start a cache daemon for this cache in the\n"
@@ -420,6 +422,26 @@ int ShowStats(const vcache::core::Config& config) {
   return 0;
 }
 
+int EvictEntry(const vcache::core::Config& config, const std::string& key) {
+  using Status = vcache::storage::DiskStorage::RemoveEntryStatus;
+  vcache::storage::DiskStorage disk(config.disk.dir, config.disk.max_size, false);
+  switch (disk.RemoveEntry(key)) {
+    case Status::kRemoved:
+      std::printf("evicted %s from %s\n", key.c_str(), config.disk.dir.c_str());
+      return 0;
+    case Status::kAbsent:
+      std::printf("no entry %s in %s\n", key.c_str(), config.disk.dir.c_str());
+      return 0;
+    case Status::kNotADigest:
+      ::fprintf(stderr, "vcache: --evict: '%s' is not a cache key\n", key.c_str());
+      return 1;
+    case Status::kFailed:
+      ::fprintf(stderr, "vcache: --evict: %s\n", disk.last_error().c_str());
+      return 1;
+  }
+  return 1;
+}
+
 int ShowCosts(const vcache::core::Config& config) {
   const std::string text = vcache::core::FormatCosts(config.disk.dir);
   std::fputs(text.c_str(), stdout);
@@ -512,6 +534,13 @@ int main(int argc, char** argv) {
       std::printf("%s cache at %s\n", ok ? "cleared" : "failed to clear",
                   config.disk.dir.c_str());
       return ok ? 0 : 1;
+    }
+    if (first == "--evict") {
+      if (argc != 3) {
+        ::fprintf(stderr, "vcache: --evict needs one key\n");
+        return 1;
+      }
+      return EvictEntry(config, argv[2]);
     }
     if (first == "--start-daemon") return StartDaemon(config);
     if (first == "--stop-daemon") return StopDaemon(config);
