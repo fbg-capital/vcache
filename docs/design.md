@@ -52,6 +52,12 @@ Included:
 - for Rust, each variable the dep-info reports the crate read through `env!` or
   `option_env!`, with its raw value or an unset marker. Raw because rustc does
   not remap env values, so a path-valued one may be baked into the artifact
+- for a Rust crate rustc links (bin, `--test`, dylib, cdylib, proc-macro), the
+  linker's identity: the `-C linker` program found on `PATH`, by canonical real
+  path and content, and the content of each gcc specs file named in
+  `-C link-arg(s)` or in that program when it is a script (musl-gcc). An
+  executable is not cached at all while `link_cache` is off
+  (configuration.md, "Rust crates rustc links")
 
 Deliberately excluded, and why each matters:
 

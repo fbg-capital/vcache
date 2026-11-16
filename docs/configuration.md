@@ -315,6 +315,35 @@ and result metadata, but link-output sidecars are deliberately local in this
 version; remote-only link caching is therefore declined. `VCACHE_READONLY=1`
 serves existing local link hits but writes neither metadata nor sidecars.
 
+### Rust crates rustc links
+
+rustc runs the linker itself, so a Rust crate is not traced the way a C or C++
+link is. Two rules apply instead, on every platform:
+
+- **An executable obeys `link_cache`.** With it off, a crate whose output is an
+  executable runs rustc uncached and counts as `rust link cache off`: a bin
+  crate, a crate with no `--crate-type` (rustc's default is bin) and a `--test`
+  harness, each when `--emit` includes `link`. cargo's build scripts are bin
+  crates too. `cargo check` (no `link`), rlibs, staticlibs, dylibs, cdylibs and
+  proc-macros stay cached.
+- **Every crate rustc links is keyed on its linker**: a bin, `--test` or
+  default crate with the link cache on, and a dylib, cdylib or proc-macro either
+  way. The key holds the program `-C linker` names (`cc` without one), found on
+  `PATH` as rustc finds it and skipping a masquerading vcache, by canonical real
+  path and content; and the content of every gcc specs file named by
+  `-specs FILE`, `-specs=FILE` or the `--specs` forms, in `-C link-arg` and
+  `-C link-args`, or, when the program is a script, in the script itself.
+  That last case is musl-gcc's, which runs gcc with
+  `-specs <prefix>/lib/musl-gcc.specs`. Nothing the driver finds on its own is
+  covered: `ld`, crt files, gcc's built-in specs, the compiler a wrapper script
+  runs, or the linker `-fuse-ld=` picks. Rebuild with `VCACHE_RECACHE=1` after
+  changing one of those, or evict the entry (below).
+
+A hit on a linked crate logs `rust: linked crate <name> served from the cache,
+entry <key>`. `vcache --evict <key>` deletes that one disk entry, so the next
+build of the crate links it again; `rust key <key>` lines name the key of every
+Rust lookup. An S3 copy of the entry is left alone.
+
 ### Verifying link hits
 
 Set both `VCACHE_LINK_CACHE=1` and `VCACHE_LINK_VERIFY=1` to check eligible cache
@@ -634,7 +663,9 @@ budget, not a hard limit: a shard is trimmed to 80% of its share when it exceeds
 it.
 
 `vcache --trim` sweeps every shard on demand; `vcache --clear` empties the cache
-and resets counters.
+and resets counters. `vcache --evict <key>` deletes one entry, by the key a
+`VCACHE_LOG` line names; the sidecars it names go when they are trimmed, since
+another entry may name the same content.
 
 Link outputs, and Rust outputs of 4 MiB or more, are stored beside the entries
 as `<digest>.linkout` and `<digest>.rustout` files in the same shards, and a

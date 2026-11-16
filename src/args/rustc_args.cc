@@ -3,6 +3,7 @@
 #include "args/rustc_args.h"
 
 #include <algorithm>
+#include <cstring>
 #include <unordered_set>
 
 #include "core/roots.h"
@@ -65,6 +66,24 @@ bool SplitJoined(const std::string& arg, std::string* opt, std::string* value) {
 
 }  // namespace
 
+bool RustcArgs::links_executable() const {
+  if (std::find(emit_kinds.begin(), emit_kinds.end(), "link") == emit_kinds.end()) {
+    return false;
+  }
+  return test_harness || crate_types.empty() ||
+         std::find(crate_types.begin(), crate_types.end(), "bin") != crate_types.end();
+}
+
+bool RustcArgs::runs_linker() const {
+  if (links_executable()) return true;
+  if (std::find(emit_kinds.begin(), emit_kinds.end(), "link") == emit_kinds.end()) {
+    return false;
+  }
+  return std::any_of(crate_types.begin(), crate_types.end(), [](const std::string& type) {
+    return type == "dylib" || type == "cdylib" || type == "proc-macro";
+  });
+}
+
 bool LooksLikeRustc(const std::string& program) {
   const std::string base = util::BaseName(program);
   return base == "rustc" || base == "rustc.exe" || StartsWith(base, "rustc-");
@@ -114,6 +133,7 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
       value = argv[++i];
     } else if (!joined) {
       // Standalone flag such as -g, -O, --test, --verbose.
+      if (arg == "--test") result.test_harness = true;
       result.base_args.push_back(arg);
       result.key_args.push_back(arg);
       continue;
@@ -165,6 +185,23 @@ RustcArgs ParseRustc(const std::vector<std::string>& argv) {
     }
 
     if (opt == "--crate-name") result.crate_name = value;
+    if (opt == "--crate-type") {
+      for (std::string& type : util::Split(value, ',', /*skip_empty=*/true)) {
+        result.crate_types.push_back(std::move(type));
+      }
+    }
+    if (opt == "-C" && StartsWith(value, "linker=")) {
+      result.linker = value.substr(std::strlen("linker="));
+    }
+    if (opt == "-C" && StartsWith(value, "link-arg=")) {
+      result.linker_args.push_back(value.substr(std::strlen("link-arg=")));
+    }
+    if (opt == "-C" && StartsWith(value, "link-args=")) {
+      for (std::string& word :
+           util::Split(value.substr(std::strlen("link-args=")), ' ', /*skip_empty=*/true)) {
+        result.linker_args.push_back(std::move(word));
+      }
+    }
 
     result.base_args.push_back(opt);
     result.base_args.push_back(value);

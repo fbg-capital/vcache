@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -66,6 +67,104 @@ std::string ResolveRustcFingerprint(const std::string& rustc,
 
 namespace {
 
+// A linker driver is a binary or a short wrapper script; a script longer than
+// this is not searched for -specs.
+constexpr uint64_t kMaxLinkerScriptBytes = 1 << 20;
+
+// True when the file starts with "#!". Reads two bytes, so a binary driver
+// such as gcc is not read for every crate that links.
+bool IsScript(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  char magic[2] = {};
+  const bool script = ::read(fd, magic, sizeof(magic)) == 2 && magic[0] == '#' &&
+                      magic[1] == '!';
+  ::close(fd);
+  return script;
+}
+
+// The files a gcc command line reads specs from: -specs FILE, -specs=FILE and
+// the same with --specs.
+std::vector<std::string> SpecsFilesNamed(const std::vector<std::string>& words) {
+  std::vector<std::string> files;
+  for (size_t i = 0; i < words.size(); ++i) {
+    for (const std::string flag : {"-specs", "--specs"}) {
+      if (words[i] == flag && i + 1 < words.size()) {
+        files.push_back(words[i + 1]);
+      } else if (util::StartsWith(words[i], flag + "=")) {
+        files.push_back(words[i].substr(flag.size() + 1));
+      }
+    }
+  }
+  return files;
+}
+
+// The whitespace-separated words of a shell script with every quote character
+// dropped. Enough to read the literal path musl-gcc passes after -specs, and
+// a word that is not a file is skipped by the caller.
+std::vector<std::string> ScriptWords(const std::string& text) {
+  std::vector<std::string> words;
+  std::string word;
+  for (const char c : text) {
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+      if (!word.empty()) words.push_back(std::move(word));
+      word.clear();
+    } else if (c != '"' && c != '\'') {
+      word += c;
+    }
+  }
+  if (!word.empty()) words.push_back(std::move(word));
+  return words;
+}
+
+}  // namespace
+
+std::string ResolveLinkerIdentity(const args::RustcArgs& parsed, const core::RootMap& roots,
+                                  const std::string& cache_dir) {
+  const std::string memo_dir = hash::FileDigestMemoDir(cache_dir);
+  const std::string named = parsed.linker.empty() ? "cc" : parsed.linker;
+  hash::Hasher hasher;
+  hasher.UpdateDelimited(named);
+
+  // A masquerading vcache on PATH runs the next program of that name, so that
+  // one is what links.
+  const std::optional<std::string> found =
+      util::FindInPath(named, util::SelfPath().value_or(""));
+  const std::optional<std::string> real = found ? util::RealPath(*found) : std::nullopt;
+  const std::optional<std::string> digest =
+      real ? hash::HashFileMemoized(*real, memo_dir) : std::nullopt;
+  std::string described = named;
+  std::vector<std::string> specs = SpecsFilesNamed(parsed.linker_args);
+  if (!digest) {
+    hasher.UpdateDelimited("unresolved");
+    described += " (not found)";
+  } else {
+    hasher.UpdateDelimited(roots.Canonicalize(*real));
+    hasher.UpdateDelimited(*digest);
+    described += " = " + *real;
+    if (IsScript(*real) && util::FileSize(*real).value_or(0) <= kMaxLinkerScriptBytes) {
+      if (const std::optional<std::string> text = util::ReadFile(*real)) {
+        for (std::string& file : SpecsFilesNamed(ScriptWords(*text))) {
+          specs.push_back(std::move(file));
+        }
+      }
+    }
+  }
+  for (const std::string& file : specs) {
+    const std::optional<std::string> specs_digest =
+        util::FileExists(file) ? hash::HashFileMemoized(file, memo_dir) : std::nullopt;
+    hasher.UpdateDelimited("specs");
+    hasher.UpdateDelimited(roots.Canonicalize(file));
+    hasher.UpdateDelimited(specs_digest.value_or("absent"));
+    described += ", specs " + file + (specs_digest ? "" : " (absent)");
+  }
+  const std::string identity = hasher.Hex();
+  VCACHE_LOG("rust linker " + described + ": " + identity);
+  return identity;
+}
+
+namespace {
+
 using core::Counter;
 using core::MapDirection;
 using core::Reason;
@@ -74,8 +173,8 @@ using core::RootMap;
 // Both bump together. A hit usually follows a manifest state to its entry key
 // without recomputing it, so an entry key bump alone would still lead an older
 // vcache from a v1 manifest into an entry whose sidecar section it skips.
-constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v6";
-constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v4";
+constexpr std::string_view kCacheKeyVersion = "vcache-rust-key-v7";
+constexpr std::string_view kManifestKeyVersion = "vcache-rust-manifest-v5";
 
 // Measured on a large Rust workspace's dev build: thresholds of 1, 2 and 4 MiB
 // gave the same warm build, 8 MiB and above a slower one, and the trimmer's
@@ -201,9 +300,12 @@ std::optional<std::vector<core::ManifestFile>> HashSources(
 }
 
 // The part of both keys that comes from the invocation itself.
+// `linker_identity` is empty for a crate rustc does not link.
 void HashInvocation(const args::RustcArgs& parsed, const RootMap& roots,
-                    const std::string& rustc_fingerprint, hash::Hasher* hasher) {
+                    const std::string& rustc_fingerprint,
+                    const std::string& linker_identity, hash::Hasher* hasher) {
   hasher->UpdateDelimited(rustc_fingerprint);
+  hasher->UpdateDelimited(linker_identity);
   hasher->UpdateDelimited(roots.Fingerprint());
   for (const std::string& arg : parsed.key_args) {
     hasher->UpdateDelimited(roots.Canonicalize(arg));
@@ -225,10 +327,11 @@ void HashExtraEnv(const core::Config& config, hash::Hasher* hasher) {
 
 std::string ComputeKey(const args::RustcArgs& parsed, const RootMap& roots,
                        const std::string& rustc_fingerprint,
+                       const std::string& linker_identity,
                        const core::Config& config, const RustManifestState& inputs) {
   hash::Hasher hasher;
   hasher.UpdateDelimited(kCacheKeyVersion);
-  HashInvocation(parsed, roots, rustc_fingerprint, &hasher);
+  HashInvocation(parsed, roots, rustc_fingerprint, linker_identity, &hasher);
 
   for (const auto& [canonical_path, digest] : inputs.files) {
     hasher.UpdateDelimited(canonical_path);
@@ -264,12 +367,13 @@ std::string ComputeKey(const args::RustcArgs& parsed, const RootMap& roots,
 // identical roots in different places must not share states.
 std::string ComputeManifestKey(const args::RustcArgs& parsed, const RootMap& roots,
                                const std::string& rustc_fingerprint,
+                               const std::string& linker_identity,
                                const core::Config& config,
                                const std::string& source_digest,
                                const std::vector<RustExtern>& externs) {
   hash::Hasher hasher;
   hasher.UpdateDelimited(kManifestKeyVersion);
-  HashInvocation(parsed, roots, rustc_fingerprint, &hasher);
+  HashInvocation(parsed, roots, rustc_fingerprint, linker_identity, &hasher);
   hasher.UpdateDelimited(roots.Canonicalize(parsed.source));
   hasher.UpdateDelimited(source_digest);
   for (const RustExtern& ext : externs) hasher.UpdateDelimited(ext.name);
@@ -864,6 +968,15 @@ Counter HitCounter(const storage::GetResult& got) {
   return got.layer == "s3" ? Counter::kHitS3 : Counter::kHitDisk;
 }
 
+// A linked artifact served from the cache is what a deploy log needs to see:
+// nothing else tells that the binary in place was not linked by this build.
+void LogLinkedHit(const args::RustcArgs& parsed, const std::string& key) {
+  if (!parsed.runs_linker()) return;
+  VCACHE_LOG("rust: linked crate " +
+             (parsed.crate_name.empty() ? parsed.source : parsed.crate_name) +
+             " served from the cache, entry " + key);
+}
+
 }  // namespace
 
 int RunRustCompile(const std::vector<std::string>& argv,
@@ -897,6 +1010,19 @@ int RunRustCompile(const std::vector<std::string>& argv,
     }
   }
 
+  // An executable is a link: with link caching off it is never served from
+  // the cache, so a changed linker or linker configuration always takes
+  // effect. Every other crate, a proc-macro included, is still cached. The
+  // output directory is made as for a cached crate: rustc does not make it
+  // before writing dep-info there.
+  if (!config.link_cache && parsed.links_executable()) {
+    core::RecordDecision(cache_dir,
+                         {Reason::kRustLinkCacheOff,
+                          parsed.crate_name.empty() ? parsed.source : parsed.crate_name});
+    util::MakeDirs(parsed.out_dir);
+    return RunPassthrough(argv);
+  }
+
   auto temp_dir = util::MakeScratchDir(cache_dir, "vcache-rs-");
   if (!temp_dir) {
     core::RecordDecision(cache_dir, Reason::kNoTempDir);
@@ -909,6 +1035,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
 
   const std::string rustc_fingerprint =
       ResolveRustcFingerprint(parsed.compiler, cache_dir);
+  const std::string linker_identity =
+      parsed.runs_linker() ? ResolveLinkerIdentity(parsed, roots, cache_dir) : std::string();
 
   const std::optional<std::vector<RustExtern>> externs = HashExterns(parsed, cache_dir);
   if (!externs) {
@@ -946,8 +1074,8 @@ int RunRustCompile(const std::vector<std::string>& argv,
   if (config.rust_dep_info_policy == core::RustDepInfoPolicy::kManifest &&
       cache != nullptr) {
     if (auto source_digest = hash::HashFile(parsed.source)) {
-      manifest_key = ComputeManifestKey(parsed, roots, rustc_fingerprint, config,
-                                        *source_digest, *externs);
+      manifest_key = ComputeManifestKey(parsed, roots, rustc_fingerprint, linker_identity,
+                                        config, *source_digest, *externs);
       VCACHE_LOG("rust manifest key " + manifest_key + " for " + parsed.source);
       states = LoadManifest(cache, manifest_key, cache_dir, &media_failed, true, nullptr,
                             /*local_only=*/false, &manifest_copy);
@@ -992,6 +1120,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
       }
       VCACHE_LOG("rust key " + states[i].key + " for " + parsed.source);
       VCACHE_LOG("rust manifest hit: " + which + ", on " + got.layer);
+      LogLinkedHit(parsed, states[i].key);
       core::RecordCounters(cache_dir, HitCounter(got), core::Counter::kManifestHit);
       if (config.read_only) return 0;
       if (manifest_copy.layer != manifest_first_layer) {
@@ -1038,7 +1167,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
         {env.name, KeyedEnvDepValue(env.name, env.value, config.rust_path_env_vars, roots)});
   }
   fresh.externs = *externs;
-  fresh.key = ComputeKey(parsed, roots, rustc_fingerprint, config, fresh);
+  fresh.key = ComputeKey(parsed, roots, rustc_fingerprint, linker_identity, config, fresh);
   const std::string& key = fresh.key;
   VCACHE_LOG("rust key " + key + " for " + parsed.source);
 
@@ -1058,6 +1187,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
                                           sidecar_store, lookup_started);
       if (outcome == HitOutcome::kServed) {
         VCACHE_LOG("rust hit on " + got.layer);
+        LogLinkedHit(parsed, key);
         core::RecordCounter(cache_dir, HitCounter(got));
         record_state();
         return true;
@@ -1191,6 +1321,7 @@ int RunRustCompile(const std::vector<std::string>& argv,
   blob.sidecar_files = std::move(sidecar_files);
   blob.stderr_text = canonical_stderr;
   blob.meta = "rustc: " + rustc_fingerprint + "\ncrate: " + parsed.crate_name +
+              (linker_identity.empty() ? "" : "\nlinker: " + linker_identity) +
               "\nroots:\n" + roots.DebugString();
   core::AppendCostMeta(&blob.meta, compiled.max_rss_kb, compiled.wall_ms);
 

@@ -4449,6 +4449,70 @@ void TestRustcArgs() {
              .cacheable(),
         "--emit with an explicit path is uncacheable");
 
+  // What the crate type says about the link: only an executable obeys link
+  // caching being off, and every crate rustc links is keyed on the linker.
+  const auto crate = [](std::vector<std::string> extra, const std::string& emit) {
+    std::vector<std::string> argv = {"rustc", "--crate-name", "c", "--emit=" + emit,
+                                     "--out-dir", "o"};
+    argv.insert(argv.end(), extra.begin(), extra.end());
+    argv.push_back("src/main.rs");
+    return args::ParseRustc(argv);
+  };
+  struct LinkCase {
+    std::vector<std::string> extra;
+    std::string emit;
+    bool executable;
+    bool linked;
+    std::string what;
+  };
+  const std::vector<LinkCase> link_cases = {
+      {{"--crate-type", "bin"}, "dep-info,link", true, true, "a bin crate"},
+      {{}, "dep-info,link", true, true, "a crate with no --crate-type (rustc's default is bin)"},
+      {{"--test"}, "dep-info,link", true, true, "a --test harness"},
+      {{"--crate-type=lib", "--test"}, "link", true, true, "a --test harness of a lib"},
+      {{"--crate-type", "proc-macro"}, "dep-info,link", false, true, "a proc-macro"},
+      {{"--crate-type", "cdylib"}, "link", false, true, "a cdylib"},
+      {{"--crate-type", "dylib"}, "link", false, true, "a dylib"},
+      {{"--crate-type", "lib"}, "dep-info,metadata,link", false, false, "a lib"},
+      {{"--crate-type", "rlib"}, "link", false, false, "an rlib"},
+      {{"--crate-type", "staticlib"}, "link", false, false, "a staticlib"},
+      {{"--crate-type", "rlib,cdylib"}, "link", false, true, "an rlib,cdylib list"},
+      {{"--crate-type", "lib", "--crate-type", "bin"}, "link", true, true,
+       "a repeated --crate-type naming bin"},
+      {{"--crate-type", "bin"}, "dep-info,metadata", false, false,
+       "a bin crate checked without --emit=link"},
+      {{"--test"}, "metadata", false, false, "a --test harness without --emit=link"},
+  };
+  for (const LinkCase& c : link_cases) {
+    const args::RustcArgs parsed = crate(c.extra, c.emit);
+    Check(parsed.cacheable(), c.what + " is cacheable");
+    Check(parsed.links_executable() == c.executable,
+          c.what + (c.executable ? " links an executable" : " links no executable"));
+    Check(parsed.runs_linker() == c.linked,
+          c.what + (c.linked ? " runs the linker" : " does not run the linker"));
+  }
+
+  const std::vector<std::pair<std::string, std::vector<std::string>>> linker_spellings = {
+      {"separate", {"-C", "linker=musl-gcc"}},
+      {"joined", {"-Clinker=musl-gcc"}},
+      {"long separate", {"--codegen", "linker=musl-gcc"}},
+      {"long joined", {"--codegen=linker=musl-gcc"}}};
+  for (const auto& [form, spelling] : linker_spellings) {
+    CheckEq(crate(spelling, "link").linker, std::string("musl-gcc"),
+            form + " -C linker is the linker");
+  }
+  CheckEq(crate({"-C", "linker=cc", "-C", "linker=/opt/x/musl-gcc"}, "link").linker,
+          std::string("/opt/x/musl-gcc"), "the last -C linker wins, as in rustc");
+  CheckEq(crate({"-C", "linker-flavor=gcc"}, "link").linker, std::string(),
+          "-C linker-flavor is not a linker");
+  CheckEq(util::Join(crate({"-C", "link-arg=-specs=/a.specs", "-Clink-args=-x  -specs /b",
+                            "-C", "link-arg=-fuse-ld=mold"},
+                           "link")
+                         .linker_args,
+                     "|"),
+          std::string("-specs=/a.specs|-x|-specs|/b|-fuse-ld=mold"),
+          "-C link-arg values and -C link-args words are the linker args, in order");
+
   Check(args::LooksLikeRustc("/home/u/.cargo/bin/rustc"), "recognises rustc by path");
   Check(!args::LooksLikeRustc("/usr/bin/g++"), "does not mistake g++ for rustc");
 }
@@ -6192,6 +6256,90 @@ void TestRustcFingerprint() {
   Age(copy, 100);
   CheckEq(rust::ResolveRustcFingerprint(copy, *scratch), first,
           "two rustc files with one banner share a fingerprint");
+}
+
+void TestRustLinkerIdentity() {
+  Section("rust::linker identity");
+
+  auto scratch = util::MakeTempDir("vcache-rust-linker-");
+  Check(scratch.has_value(), "linker scratch exists");
+  if (!scratch) return;
+  struct ScratchGuard {
+    std::string path;
+    ~ScratchGuard() { util::RemoveRecursive(path); }
+  } guard{*scratch};
+
+  const core::RootMap roots = MakeRoots({});
+  const std::string bin = *scratch + "/bin";
+  const std::string cache = *scratch + "/cache";
+  util::MakeDirs(bin);
+  util::MakeDirs(cache);
+  auto install = [](const std::string& path, const std::string& text) {
+    util::WriteFileAtomic(path, text);
+    ::chmod(path.c_str(), 0755);
+  };
+  const auto identity = [&](std::vector<std::string> extra) {
+    std::vector<std::string> argv = {"rustc", "--crate-type", "bin", "--emit=link",
+                                     "--out-dir", "o"};
+    argv.insert(argv.end(), extra.begin(), extra.end());
+    argv.push_back("src/main.rs");
+    return rust::ResolveLinkerIdentity(args::ParseRustc(argv), roots, cache);
+  };
+
+  // musl-gcc's shape: a script that runs gcc with a specs file of its own.
+  const std::string specs = bin + "/musl-gcc.specs";
+  const std::string wrapper = bin + "/musl-gcc";
+  util::WriteFileAtomic(specs, "*link:\n+ \n");
+  install(wrapper, "#!/bin/sh\nexec \"${REALGCC:-gcc}\" \"$@\" -specs \"" + specs + "\"\n");
+  const std::string first = identity({"-C", "linker=" + wrapper});
+  CheckEq(identity({"-C", "linker=" + wrapper}), first,
+          "an unchanged linker and specs file keep their identity");
+
+  util::WriteFileAtomic(specs, "*link:\n+ --build-id\n");
+  const std::string respecified = identity({"-C", "linker=" + wrapper});
+  Check(respecified != first, "a changed specs file named by a linker script is a new linker");
+
+  install(wrapper, "#!/bin/sh\nexec \"${REALGCC:-gcc}\" \"$@\" -specs=\"" + specs + "\"\n");
+  const std::string rewritten = identity({"-C", "linker=" + wrapper});
+  Check(rewritten != respecified, "a changed linker script is a new linker");
+  util::WriteFileAtomic(specs, "*link:\n+ \n");
+  Check(identity({"-C", "linker=" + wrapper}) != rewritten,
+        "the -specs=FILE spelling in a script is followed too");
+
+  // A specs file passed through -C link-arg is covered for any linker.
+  const std::string arg_specs = bin + "/arg.specs";
+  util::WriteFileAtomic(arg_specs, "*link:\n+ \n");
+  const std::string plain = bin + "/plain-cc";
+  install(plain, std::string("\x7f") + "ELF not a script");
+  const std::string by_arg = identity({"-C", "linker=" + plain, "-C",
+                                       "link-arg=-specs=" + arg_specs});
+  util::WriteFileAtomic(arg_specs, "*link:\n+ -z now\n");
+  Check(identity({"-C", "linker=" + plain, "-C", "link-arg=-specs=" + arg_specs}) != by_arg,
+        "a changed specs file named by -C link-arg is a new linker");
+  const std::string by_args = identity({"-C", "linker=" + plain, "-C",
+                                        "link-args=--specs " + arg_specs});
+  util::WriteFileAtomic(arg_specs, "*link:\n+ -z lazy\n");
+  Check(identity({"-C", "linker=" + plain, "-C", "link-args=--specs " + arg_specs}) != by_args,
+        "a changed specs file named by -C link-args is a new linker");
+
+  // The program itself, by content: the specs words of a binary are not read.
+  const std::string same_size = std::string("\x7f") + "ELF not a scrip!";
+  const std::string before = identity({"-C", "linker=" + plain});
+  install(plain, same_size);
+  Check(identity({"-C", "linker=" + plain}) != before, "a changed linker binary is a new linker");
+
+  // Found on PATH by name, as rustc finds it; `cc` when no -C linker is given.
+  const char* saved_path = std::getenv("PATH");
+  const std::string old_path = saved_path != nullptr ? saved_path : "";
+  ::setenv("PATH", bin.c_str(), 1);
+  const std::string unresolved = identity({});
+  install(bin + "/cc", "#!/bin/sh\nexec gcc \"$@\"\n");
+  const std::string default_cc = identity({});
+  Check(default_cc != unresolved, "with no -C linker, cc found on PATH is the linker");
+  CheckEq(identity({"-C", "linker=cc"}), default_cc, "-C linker=cc is the default linker");
+  install(bin + "/cc", "#!/bin/sh\nexec clang \"$@\"\n");
+  Check(identity({}) != default_cc, "a changed cc on PATH is a new linker");
+  ::setenv("PATH", old_path.c_str(), 1);
 }
 
 void TestFileDigestMemo() {
@@ -7960,6 +8108,7 @@ int main(int argc, char** argv) {
   TestCost();
   TestMemoryEstimates();
   TestRustcFingerprint();
+  TestRustLinkerIdentity();
   TestFileDigestMemo();
   TestFileDigestTable();
   TestCxxManifest();

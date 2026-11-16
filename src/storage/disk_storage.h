@@ -37,6 +37,11 @@ class DiskStorage : public Storage {
   // is running. Used by `vcache --clear`.
   bool Clear();
 
+  // Deletes the one entry stored under `key`, for `vcache --evict`. Sidecars
+  // it names stay until trimmed: another entry may name the same content.
+  enum class RemoveEntryStatus { kRemoved, kAbsent, kNotADigest, kFailed };
+  RemoveEntryStatus RemoveEntry(const std::string& key);
+
   // Sums the on-disk size of all entries. Walks the whole tree, so it is only
   // called by `vcache --show-stats`.
   uint64_t TotalSize() const;
