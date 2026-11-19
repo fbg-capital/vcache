@@ -3786,6 +3786,25 @@ except Exception: sys.exit(1)
       "$(shadow_stat "$WORK/shadow-r4" 'cache miss')" "0"
   done
 
+  # A comment edit preprocesses to the same text, so the disk's stale state and
+  # the state S3 holds name one result key. They differ in what they recorded,
+  # and the lookup must still try the one from S3.
+  cmd=(gcc -c main.c -o "$WORK/shadow/main.o")
+  rm -rf "$WORK/shadow-baked" "$WORK/shadow-r"* "$S3DIR"/*
+  printf '#define V 1\n/* baked */\n' > "$WORK/shadow/x.h"
+  VCACHE_CXX_MANIFEST=1 shadow_run "$WORK/shadow-baked" "$WORK/shadow-bake.log" "${cmd[@]}"
+  printf '#define V 1\n' > "$WORK/shadow/x.h"
+  VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r1" "$WORK/shadow-r1.log" "${cmd[@]}"
+  cp -R "$WORK/shadow-baked" "$WORK/shadow-r2"
+  VCACHE_DIR="$WORK/shadow-r2" "$VCACHE" --zero-stats >/dev/null  # the copy brings the bake's counts
+  log="$WORK/shadow-comment-r2.log"
+  rm -f "$log"
+  VCACHE_CXX_MANIFEST=1 with_s3 shadow_run "$WORK/shadow-r2" "$log" "${cmd[@]}"
+  check "comment edit: the stale disk copy sends the lookup on to S3" \
+    "$(grep -c 'no state on disk holds; trying the copy on s3' "$log")" "1"
+  check "comment edit: S3's state, with the same key, answers without preprocessing" \
+    "$(grep -c '^.* preprocess: ' "$log")" "0"
+
   # The same through a daemon: the continuation is its kGetAfter, and the
   # daemon must not replace its disk copy with S3's while answering it, or
   # the states only the disk has are lost.
