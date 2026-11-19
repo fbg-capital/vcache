@@ -60,6 +60,7 @@ std::string Escape(const std::string& path) {
       case ' ':
       case '\t':
       case '#':
+      case ':':
       case '\\':
         out.push_back('\\');
         out.push_back(c);
