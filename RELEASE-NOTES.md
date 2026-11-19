@@ -24,6 +24,17 @@ Fixes:
   - Only `cxx_manifest` is affected, which is off by default. Dependency-scan,
     link and Rust manifests already name their inputs in their result keys.
 
+### FBG integration
+
+The FBG branch already carried this fix, so the merge brings only the version
+and upstream's S3 comment-edit test. Since 2.0.2 the fork keys every Rust crate
+that rustc links on its linker (the linker's contents, `-C linker=` and the
+link arguments), and serves a linked executable only with `link_cache` on. That
+moved `vcache-rust-key` to v7 and `vcache-rust-manifest` to v5, so Rust entries
+from earlier FBG builds miss once. The other namespaces are unchanged:
+`vcache-key` v8, `vcache-depscan` v6, `vcache-link` v6 and
+`vcache-cxx-manifest` v9.
+
 ## 2.0.2
 
 A patch release. Cache keys are unchanged, so 2.0.0 and 2.0.1 entries keep
@@ -80,10 +91,11 @@ Fixes:
 
 The FBG branch already carried the upstream correctness and portability fixes
 below. This merge retains its newer depfile repairs, link verification and cold
-manifest recording. Its cache namespaces remain `vcache-key` v8,
-`vcache-depscan` v6, `vcache-link` v6, `vcache-rust-key` v6,
-`vcache-rust-manifest` v4 and `vcache-cxx-manifest` v9; the version change does
-not invalidate entries from the preceding FBG build. Its daemon protocol was
+manifest recording. At this merge its cache namespaces stayed at `vcache-key`
+v8, `vcache-depscan` v6, `vcache-link` v6, `vcache-rust-key` v6,
+`vcache-rust-manifest` v4 and `vcache-cxx-manifest` v9; the version change did
+not invalidate entries from the preceding FBG build. The 2.0.3 section lists
+the current namespaces. Its daemon protocol was
 already v2, so this merge does not require a daemon restart.
 
 The fork keeps `cxx_manifest_absent_deps` enabled by default for the patched
